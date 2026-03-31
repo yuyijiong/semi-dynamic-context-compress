@@ -9,21 +9,66 @@ import sys
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
-
+import pathlib
 import torch
-from transformers import TrainingArguments, AutoTokenizer, Qwen3ForCausalLM, Qwen3Model
+from transformers import AutoTokenizer, Qwen3ForCausalLM, Qwen3Model,AutoModelForCausalLM,AutoModel
 from transformers.trainer_utils import is_main_process
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Dict, Any, Optional
 
 import sft_ctxcomp_static as ctxcomp_sft
 import sft_ctxcomp_static_multiratio as multiratio_sft
 
 from modeling_ctxcomp import CtxCompSemiDynamicModel
+from sft_ctxcomp_train_config import (
+    add_ctxcomp_sft_cli_args,
+    build_ctxcomp_training_arguments,
+    comp_ratio_or_len_as_tuple,
+    format_comp_ratio_for_output_dir,
+)
+from dataset_utils_ctxcomp import DEFAULT_DATA_CONFIG,TEST_DATA_CONFIG
 
 os.environ.setdefault("WANDB_PROJECT", "SFT_ctxcomp_semi_dynamic")
 
-DEFAULT_COMP_RATIO_OR_LEN_OPTIONS: List[Union[float, int]] = [0.5, 0.25, 0.125, 0.0625, 0.03125]
-DEFAULT_RATIO_WEIGHT = [1, 1.2, 1.2, 1.4, 1.4]
+DEFAULT_RATIO_WEIGHT = None #[1, 1.2, 1.2, 1.4, 1.4]
+
+SEMI_DYNAMIC_SFT_CLI_DEFAULTS = {
+    "comp_ratio_or_len": (0.25, 0.125, 0.0625),
+    "encoder_base_model_path": "/share/models/Qwen3.5-0.8B",
+    "decoder_base_model_path": "/share/models/Qwen3.5-0.8B",
+    "mlp_converter_hidden_dim": 4096,
+    "placeholder_id": 248076,
+    "memory_token_begin_id": 247000,
+    "feature_extract_method": "mean_pooling",
+    "encoder_training": "lora",
+    "decoder_training": "lora",
+
+
+    "context_max_length": 1300,
+    "context_min_length": 64,
+    "decoder_max_length": 1024,
+    "decoder_min_length": 1,
+    "dataset_num_proc": 40,
+    "dataset_exclude_sign": "eval",
+    "template_dir": ".",
+    "add_eos_token_to_context": True,
+
+
+    "use_gradient_checkpointing": False,
+    "per_device_train_batch_size": 10,
+    "max_steps": 100000,
+    "gradient_accumulation_steps": 1,
+    "learning_rate": 4e-5,
+    "warmup_steps": 100,
+    "eval_steps": 500,
+    "save_steps": 20000,
+    "save_total_limit": 5,
+    "logging_steps": 20,
+    "lr_scheduler_type": "constant_with_warmup",
+    "seed": 0,
+    "group_by_length": True,
+    "num_buckets": 10,
+    "collator_pad_to_multiple_of": None,
+}
 
 load_single_ratio_dataset = multiratio_sft.load_single_ratio_dataset
 
@@ -105,102 +150,63 @@ class MultiratioDynamicCtxCompCollator(multiratio_sft.MultiratioCtxCompCollator)
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Train CtxCompSemiDynamicModel")
-    parser.add_argument("--doc_max_length", type=int, default=1200)
-    parser.add_argument("--doc_min_length", type=int, default=64)
-    parser.add_argument("--feature_extract_method", type=str, default="mean_pooling",
-                        choices=["mean_pooling", "mean_pooling_causal", "last_tokens", "same_memory_tokens", "different_memory_tokens"])
-    parser.add_argument("--encoder_training", type=str, default="lora")
-    parser.add_argument("--decoder_training", type=str, default="lora")
+    add_ctxcomp_sft_cli_args(parser, SEMI_DYNAMIC_SFT_CLI_DEFAULTS)
     args = parser.parse_args()
 
     if torch.distributed.is_initialized():
-        try:
-            store = torch.distributed.get_store()
-            if store is not None and hasattr(store, "set_timeout"):
-                store.set_timeout(4 * 3600)
-        except Exception:
-            pass
+        store = torch.distributed.get_store()
+        if store is not None and hasattr(store, "set_timeout"):
+            store.set_timeout(4 * 3600)
 
-    max_length = 1200
-    min_length = 1
-    doc_max_length = args.doc_max_length
-    doc_min_length = args.doc_min_length
-    placeholder_id = 151656
-    memory_token_begin_id = 150000
-    feature_extract_method = args.feature_extract_method
-    encoder_training = args.encoder_training
-    decoder_training = args.decoder_training
-    comp_ratio_or_len_init = tuple(DEFAULT_COMP_RATIO_OR_LEN_OPTIONS)
-    GROUP_BY_LENGTH = True
+    comp_ratio_options = comp_ratio_or_len_as_tuple(args.comp_ratio_or_len)
 
     output_dir = (
-        f"./training_output/ctxcomp-semi-dynamic-{feature_extract_method}-doclen={doc_max_length}to{doc_min_length}-"
-        f"ratios={comp_ratio_or_len_init[0]}_{comp_ratio_or_len_init[-1]}-enc={encoder_training}-dec={decoder_training}"
+        f"./training_output/ctxcomp-semi-dynamic-{args.feature_extract_method}-contextlen={args.context_max_length}to{args.context_min_length}-"
+        f"ratios={format_comp_ratio_for_output_dir(args.comp_ratio_or_len)}-enc={pathlib.Path(args.encoder_base_model_path).name}-{args.encoder_training}-dec={pathlib.Path(args.decoder_base_model_path).name}-{args.decoder_training}"
     )
-    train_args = TrainingArguments(
-        report_to="wandb",
+    train_args = build_ctxcomp_training_arguments(
+        args,
         output_dir=output_dir,
-        run_name=output_dir,
-        optim="adamw_torch",
-        learning_rate=4e-5,
-        lr_scheduler_type="constant_with_warmup",
-        warmup_steps=100,
-        max_steps=200000,
-        eval_steps=500,
-        eval_strategy="no",
-        save_steps=20000,
-        save_strategy="steps",
-        per_device_train_batch_size=4,
-        gradient_accumulation_steps=1,
-        logging_steps=20,
-        bf16=True,
-        fp16=False,
-        seed=0,
-        save_total_limit=5,
-        torch_compile=False,
-        ddp_find_unused_parameters=False,
-        max_grad_norm=1.0,
+        ddp_find_unused_parameters=not args.use_gradient_checkpointing,
         gradient_checkpointing=False,
-        dataloader_drop_last=True,
     )
 
-    data_config = [
-        {"dir": "../数据合成/doc_sum_qa_shortsum_synthetic_text_128_en/Qwen3-30B-A3B-Instruct-2507__vllm", "task": "qa_and_sum", "max_files": 50, "max_samples": 1000000},
-    ]
+    data_config = DEFAULT_DATA_CONFIG#TEST_DATA_CONFIG #
 
-    embedding_path = "/share/models/Qwen3-Embedding-0.6B"
-    generation_path = "/share/models/Qwen3-4B-Instruct-2507"
+    tokenizer_decoder = AutoTokenizer.from_pretrained(args.decoder_base_model_path, trust_remote_code=True)
+    tokenizer_encoder = AutoTokenizer.from_pretrained(args.encoder_base_model_path, trust_remote_code=True, padding_side="left")
+    placeholder_token = tokenizer_decoder.convert_ids_to_tokens(args.placeholder_id)
 
-    tokenizer_decoder = AutoTokenizer.from_pretrained(generation_path, trust_remote_code=True)
-    tokenizer_encoder = AutoTokenizer.from_pretrained(embedding_path, trust_remote_code=True, padding_side="left")
-    placeholder_token = tokenizer_decoder.convert_ids_to_tokens(placeholder_id)
-
-    print("Loading encoder from", embedding_path)
-    encoder = Qwen3Model.from_pretrained(
-        embedding_path,
+    print("Loading encoder from", args.encoder_base_model_path)
+    encoder = AutoModel.from_pretrained(
+        args.encoder_base_model_path,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
     ).eval()
 
-    print("Loading decoder from", generation_path)
-    decoder = Qwen3ForCausalLM.from_pretrained(
-        generation_path,
+    print("Loading decoder from", args.decoder_base_model_path)
+    decoder = AutoModelForCausalLM.from_pretrained(
+        args.decoder_base_model_path,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
     ).eval()
+
+    if args.use_gradient_checkpointing:
+        encoder.gradient_checkpointing_enable({"use_reentrant": False})
+        decoder.gradient_checkpointing_enable({"use_reentrant": False})
 
     model = CtxCompSemiDynamicModel(
         encoder=encoder,
         decoder=decoder,
-        placeholder_token_id=placeholder_id,
-        memory_token_begin_id=memory_token_begin_id,
-        comp_ratio_or_len=comp_ratio_or_len_init,
-        mlp_converter_hidden_dim=4096,
-        feature_extract_method=feature_extract_method,
-        encoder_training=encoder_training,
-        decoder_training=decoder_training,
+        placeholder_token_id=args.placeholder_id,
+        memory_token_begin_id=args.memory_token_begin_id,
+        comp_ratio_or_len=comp_ratio_options,
+        mlp_converter_hidden_dim=args.mlp_converter_hidden_dim,
+        feature_extract_method=args.feature_extract_method,
+        encoder_training=args.encoder_training,
+        decoder_training=args.decoder_training,
         discretize_ratio_mode="round",
         discretize_compare_in_log=False,
     )
@@ -213,38 +219,44 @@ def main():
     model.print_trainable_parameters()
 
     with train_args.main_process_first(desc="Loading dataset with compress_len_labels"):
-        num_proc = 4
         ds = load_single_ratio_dataset(
             data_config=data_config,
-            comp_ratio_or_len_options=DEFAULT_COMP_RATIO_OR_LEN_OPTIONS,
+            comp_ratio_or_len_options=list(comp_ratio_options),
             tokenizer_decoder=tokenizer_decoder,
             tokenizer_encoder=tokenizer_encoder,
-            num_proc=num_proc,
-            max_length=max_length,
-            min_length=min_length,
-            doc_max_length=doc_max_length,
-            doc_min_length=doc_min_length,
+            num_proc=args.dataset_num_proc,
+            max_length=args.decoder_max_length,
+            min_length=args.decoder_min_length,
+            context_max_length=args.context_max_length,
+            context_min_length=args.context_min_length,
             placeholder_token=placeholder_token,
-            feature_extract_method=feature_extract_method,
+            feature_extract_method=args.feature_extract_method,
             seed=train_args.seed,
-            exclude_sign="eval",
+            exclude_sign=args.dataset_exclude_sign or None,
             add_compress_len_labels=True,
+            add_eos_token_to_context=args.add_eos_token_to_context,
+            generation_path=args.decoder_base_model_path,
+            template_dir=args.template_dir,
         )
         print("Dataset size (with compress_len_labels):", len(ds))
 
+    _collator_kw = {}
+    if args.collator_pad_to_multiple_of is not None:
+        _collator_kw["pad_to_multiple_of"] = args.collator_pad_to_multiple_of
     data_collator = MultiratioDynamicCtxCompCollator(
-        comp_ratio_or_len_options=DEFAULT_COMP_RATIO_OR_LEN_OPTIONS,
-        placeholder_id=placeholder_id,
-        feature_extract_method=feature_extract_method,
+        comp_ratio_or_len_options=list(comp_ratio_options),
+        placeholder_id=args.placeholder_id,
+        feature_extract_method=args.feature_extract_method,
         ratios_weight=DEFAULT_RATIO_WEIGHT,
         tokenizer=tokenizer_decoder,
         tokenizer_encoder=tokenizer_encoder,
         padding=True,
-        max_length=doc_max_length,
+        max_length=args.context_max_length,
         label_pad_token_id=-100,
+        **_collator_kw,
     )
 
-    if GROUP_BY_LENGTH:
+    if args.group_by_length:
         trainer = DynamicBucketedCtxCompTrainer(
             model=model,
             args=train_args,
@@ -253,7 +265,7 @@ def main():
             eval_dataset=None,
             processing_class=tokenizer_decoder,
             length_column_name="context_len",
-            num_buckets=5,
+            num_buckets=args.num_buckets,
         )
     else:
         trainer = DynamicCtxCompTrainer(
@@ -270,3 +282,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+#CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7  nohup accelerate launch --config_file ddp_config.yaml --num_processes 8 sft_ctxcomp_semi_dynamic.py >sft_semi_dynamic.log 2>&1 &
+#CUDA_VISIBLE_DEVICES=0  accelerate launch --config_file ddp_config.yaml --num_processes 1 sft_ctxcomp_semi_dynamic.py

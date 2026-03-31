@@ -1,7 +1,8 @@
 """
 Dataset processing utilities for CtxComp SFT.
 
-Provides: chat template setup, encode_* functions, load_from_data_config.
+Provides: chat template setup, encode_* functions (e.g. encode_context), load_from_data_config,
+DEFAULT_DATA_CONFIG (aggregated synthetic QA/sum parquet roots under context_qa_sum_qwen3_synthetic).
 Used by sft_ctxcomp_static.py, sft_ctxcomp_static_swa.py, sft_ctxcomp_static_multiratio.py, etc.
 
 When using return_assistant_tokens_mask=True with apply_chat_template, the tokenizer's
@@ -16,6 +17,81 @@ from typing import Optional, Any, List, Dict, Union, Sequence
 
 import numpy as np
 from datasets import Dataset, concatenate_datasets
+
+CONTEXT_QA_SUM_SYNTHETIC_ROOT = (
+    "/share/yyj/edge_memory/semi_dynamic_soft_context_compress/SFT/context_qa_sum_qwen3_synthetic"
+)
+
+TEST_DATA_CONFIG: List[Dict[str, Any]] = [
+    {
+        "dir": f"{CONTEXT_QA_SUM_SYNTHETIC_ROOT}/doc_sum_qa_shortsum_synthetic_text_128_en__Qwen3-30B-A3B-Instruct-2507__vllm",
+        "task": "qa_and_sum",
+        "max_files": 1,
+        "max_samples": 10000,
+    }]
+
+DEFAULT_DATA_CONFIG: List[Dict[str, Any]] = [
+    {
+        "dir": f"{CONTEXT_QA_SUM_SYNTHETIC_ROOT}/doc_sum_qa_shortsum_synthetic_text_128_en__Qwen3-30B-A3B-Instruct-2507__vllm",
+        "task": "qa_and_sum",
+        "max_files": 50,
+        "max_samples": 1000000,
+    },
+    {
+        "dir": f"{CONTEXT_QA_SUM_SYNTHETIC_ROOT}/doc_sum_qa_shortsum_synthetic_text_128_zh__Qwen3-30B-A3B-Instruct-2507__vllm",
+        "task": "qa_and_sum",
+        "max_files": 50,
+        "max_samples": 750000,
+    },
+    {
+        "dir": f"{CONTEXT_QA_SUM_SYNTHETIC_ROOT}/doc_sum_qa_shortsum_synthetic_text_256_en__Qwen3-30B-A3B-Instruct-2507__vllm",
+        "task": "qa_and_sum",
+        "max_files": 50,
+        "max_samples": 1000000,
+    },
+    {
+        "dir": f"{CONTEXT_QA_SUM_SYNTHETIC_ROOT}/doc_sum_qa_shortsum_synthetic_text_256_zh__Qwen3-30B-A3B-Instruct-2507__vllm",
+        "task": "qa_and_sum",
+        "max_files": 50,
+        "max_samples": 750000,
+    },
+    {
+        "dir": f"{CONTEXT_QA_SUM_SYNTHETIC_ROOT}/doc_sum_qa_shortsum_synthetic_text_512_en__Qwen3-30B-A3B-Instruct-2507__vllm",
+        "task": "qa_and_sum",
+        "max_files": 50,
+        "max_samples": 1000000,
+    },
+    {
+        "dir": f"{CONTEXT_QA_SUM_SYNTHETIC_ROOT}/doc_sum_qa_shortsum_synthetic_text_512_zh__Qwen3-30B-A3B-Instruct-2507__vllm",
+        "task": "qa_and_sum",
+        "max_files": 50,
+        "max_samples": 750000,
+    },
+    {
+        "dir": f"{CONTEXT_QA_SUM_SYNTHETIC_ROOT}/doc_complex_qa_shortsum_synthetic_text_1024_en__Qwen3-30B-A3B-Instruct-2507__vllm",
+        "task": "qa_and_sum",
+        "max_files": 50,
+        "max_samples": 1000000,
+    },
+    {
+        "dir": f"{CONTEXT_QA_SUM_SYNTHETIC_ROOT}/doc_complex_qa_shortsum_synthetic_text_1024_zh__Qwen3-30B-A3B-Instruct-2507__vllm",
+        "task": "qa_and_sum",
+        "max_files": 50,
+        "max_samples": 750000,
+    },
+    {
+        "dir": f"{CONTEXT_QA_SUM_SYNTHETIC_ROOT}/doc_multi_doc_multi_qa_short_sum_synthetic_text_128_en__Qwen3-30B-A3B-Instruct-2507__vllm",
+        "task": "multi_context_qa",
+        "max_files": 50,
+        "max_samples": 500000,
+    },
+    {
+        "dir": f"{CONTEXT_QA_SUM_SYNTHETIC_ROOT}/doc_multi_doc_multi_qa_short_sum_synthetic_text_128_zh__Qwen3-30B-A3B-Instruct-2507__vllm",
+        "task": "multi_context_qa",
+        "max_files": 50,
+        "max_samples": 300000,
+    },
+]
 
 
 def apply_qwen3_chat_template(tokenizer, generation_path: str, template_dir: Optional[str] = None) -> None:
@@ -69,12 +145,12 @@ def encode_qa_and_sum(
     tokenizer_decoder,
     pretrain=False,
     system_prompt=None,
-    num_doc_tokens=0,
+    comp_ratio_or_len=0,
     placeholder_token="<|endoftext|>",
     feature_extract_method="mean_pooling",
 ):
-    context_len = len(example["doc_input_ids"])
-    n_placeholders = _n_placeholders_from_ratio(context_len, num_doc_tokens, feature_extract_method)
+    context_len = len(example["context_input_ids"])
+    n_placeholders = _n_placeholders_from_ratio(context_len, comp_ratio_or_len, feature_extract_method)
 
     has_qa = "question" in example and "answer" in example and example.get("question") and example.get("answer")
     has_sum = "summary" in example and example.get("summary")
@@ -124,21 +200,21 @@ def encode_qa_and_sum(
     return {"input_ids": ids["input_ids"], "attention_mask": ids["attention_mask"], "labels": labels}
 
 
-def encode_multi_doc_qa(
+def encode_multi_context_qa(
     example,
     tokenizer_decoder,
     pretrain=False,
     system_prompt=None,
-    num_doc_tokens=0,
+    comp_ratio_or_len=0,
     placeholder_token="<|endoftext|>",
     feature_extract_method="mean_pooling",
 ):
-    context_len = len(example["doc_input_ids"])
-    n_placeholders = _n_placeholders_from_ratio(context_len, num_doc_tokens, feature_extract_method)
+    context_len = len(example["context_input_ids"])
+    n_placeholders = _n_placeholders_from_ratio(context_len, comp_ratio_or_len, feature_extract_method)
     questions = example["questions"]
     answers = example["answers"]
     if not questions or not answers or len(questions) != len(answers):
-        raise ValueError("encode_multi_doc_qa: questions and answers must be non-empty and same length")
+        raise ValueError("encode_multi_context_qa: questions and answers must be non-empty and same length")
     first_user_content = f"Context: {placeholder_token * n_placeholders}\n\nQuestion: {questions[0]}"
     conversations = [{"role": "user", "content": first_user_content}, {"role": "assistant", "content": answers[0]}]
     for q, a in zip(questions[1:], answers[1:]):
@@ -168,12 +244,12 @@ def encode_text_reconstruction(
     tokenizer_decoder,
     pretrain=False,
     system_prompt=None,
-    num_doc_tokens=0,
+    comp_ratio_or_len=0,
     placeholder_token="<|endoftext|>",
     feature_extract_method="mean_pooling",
 ):
-    context_len = len(example["doc_input_ids"])
-    n_placeholders = _n_placeholders_from_ratio(context_len, num_doc_tokens, feature_extract_method)
+    context_len = len(example["context_input_ids"])
+    n_placeholders = _n_placeholders_from_ratio(context_len, comp_ratio_or_len, feature_extract_method)
     conversations = [
         {"role": "user", "content": f"Context: {placeholder_token * n_placeholders}\n\nPlease repeat the context."},
         {"role": "assistant", "content": example["context"]},
@@ -197,21 +273,39 @@ def encode_text_reconstruction(
     return {"input_ids": ids["input_ids"], "attention_mask": ids["attention_mask"], "labels": labels}
 
 
-def encode_doc(example, tokenizer_encoder, add_compress_len_labels: bool = False):
-    ids = tokenizer_encoder(example["context"])
+def encode_context(
+    example,
+    tokenizer_encoder,
+    add_compress_len_labels: bool = False,
+    add_eos_token_to_context: bool = True,
+):
+    encodings = tokenizer_encoder(example["context"])
+    input_ids = list(encodings["input_ids"])
+    attention_mask = list(encodings["attention_mask"])
+
+    if add_eos_token_to_context:
+        eos_id = tokenizer_encoder.eos_token_id
+        if eos_id is None:
+            raise ValueError(
+                "encode_context: tokenizer has no eos_token_id; define eos on the tokenizer or pass add_eos_token_to_context=False"
+            )
+        if not input_ids or input_ids[-1] != eos_id:
+            input_ids.append(eos_id)
+            attention_mask.append(1)
+
     out = {
-        "doc_input_ids": ids["input_ids"],
-        "doc_attention_mask": ids["attention_mask"],
-        "context_len": len(ids["input_ids"]),
+        "context_input_ids": input_ids,
+        "context_attention_mask": attention_mask,
+        "context_len": len(input_ids),
     }
     if add_compress_len_labels and "short_summary" in example and example.get("short_summary"):
         short_ids = tokenizer_encoder(example["short_summary"], add_special_tokens=False)
         short_len = len(short_ids["input_ids"])
-        out["compress_len_labels"] = math.log2(len(ids["input_ids"]) / short_len) if short_len else 0.0
+        out["compress_len_labels"] = math.log2(len(input_ids) / short_len) if short_len else 0.0
     return out
 
 
-def build_multi_doc_context(example):
+def build_context_from_passages(example):
     if "docs" not in example:
         raise ValueError("docs not in dataset")
     docs = example["docs"]
@@ -263,20 +357,21 @@ def load_from_data_config(
     num_proc: int,
     max_length: int,
     min_length: int,
-    doc_max_length: int,
-    doc_min_length: int,
+    context_max_length: int,
+    context_min_length: int,
     comp_ratio_or_len: Union[int, float],
     placeholder_token: str,
     feature_extract_method: str,
     seed: int = 0,
     exclude_sign: Optional[str] = None,
     add_compress_len_labels: bool = False,
+    add_eos_token_to_context: bool = True,
     generation_path: Optional[str] = None,
     template_dir: Optional[str] = None,
 ) -> Dataset:
     """
     Load and encode dataset from data_config. Supported tasks: qa_and_sum, qa, sum,
-    multi_doc_qa, text_reconstruct.
+    multi_context_qa, text_reconstruct.
 
     If generation_path is not None, applies Qwen3 chat template (instruct/thinking/nonthink)
     to tokenizer_decoder at the start, so that return_assistant_tokens_mask works.
@@ -284,8 +379,8 @@ def load_from_data_config(
     if generation_path is not None:
         apply_qwen3_chat_template(tokenizer_decoder, generation_path, template_dir)
 
-    supported_tasks = ("qa_and_sum", "qa", "sum", "multi_doc_qa", "text_reconstruct")
-    empty_dict = {"input_ids": [], "attention_mask": [], "labels": [], "doc_input_ids": [], "doc_attention_mask": []}
+    supported_tasks = ("qa_and_sum", "qa", "sum", "multi_context_qa", "text_reconstruct")
+    empty_dict = {"input_ids": [], "attention_mask": [], "labels": [], "context_input_ids": [], "context_attention_mask": []}
     if add_compress_len_labels:
         empty_dict["compress_len_labels"] = []
     ds_list = []
@@ -311,52 +406,49 @@ def load_from_data_config(
         if max_samples is not None and len(ds_ori) > 0:
             ds_ori = ds_ori.select(range(min(max_samples, len(ds_ori))))
 
-        if task == "multi_doc_qa" and "context" not in ds_ori.column_names:
-            ds_ori = ds_ori.map(build_multi_doc_context, num_proc=num_proc, remove_columns=["docs"])
+        if task == "multi_context_qa" and "context" not in ds_ori.column_names:
+            ds_ori = ds_ori.map(build_context_from_passages, num_proc=num_proc, remove_columns=["docs"])
         else:
             ds_ori = rename_context(ds_ori)
 
-        ds_doc = ds_ori.map(
-            lambda e: encode_doc(e, tokenizer_encoder=tokenizer_encoder, add_compress_len_labels=add_compress_len_labels),
+        ds_ctx = ds_ori.map(
+            lambda e: encode_context(
+                e,
+                tokenizer_encoder=tokenizer_encoder,
+                add_compress_len_labels=add_compress_len_labels,
+                add_eos_token_to_context=add_eos_token_to_context,
+            ),
             num_proc=num_proc,
-            desc="Encoding doc",
+            desc="Encoding context",
         )
-        if add_compress_len_labels:
-
-            def _ensure_compress_len_labels(e):
-                if "compress_len_labels" not in e or e.get("compress_len_labels") is None:
-                    return {**e, "compress_len_labels": 0.0}
-                return e
-
-            ds_doc = ds_doc.map(_ensure_compress_len_labels, num_proc=num_proc, desc="Ensure compress_len_labels")
-        ds_doc = ds_doc.filter(lambda x: doc_min_length <= x["context_len"] <= doc_max_length, num_proc=num_proc)
-        if len(ds_doc) == 0:
+        ds_ctx = ds_ctx.filter(lambda x: context_min_length <= x["context_len"] <= context_max_length, num_proc=num_proc)
+        if len(ds_ctx) == 0:
             continue
 
-        keep_cols = ["doc_input_ids", "doc_attention_mask", "context_len"] + (
+        keep_cols = ["context_input_ids", "context_attention_mask", "context_len"] + (
             ["compress_len_labels"] if add_compress_len_labels else []
         )
 
         def _encode_gen(ds, ratio, desc_suffix=""):
-            if task == "multi_doc_qa":
+            if task == "multi_context_qa":
                 ds_out = ds.map(
-                    lambda e: encode_multi_doc_qa(
+                    lambda e: encode_multi_context_qa(
                         e,
                         tokenizer_decoder=tokenizer_decoder,
-                        num_doc_tokens=ratio,
+                        comp_ratio_or_len=ratio,
                         placeholder_token=placeholder_token,
                         feature_extract_method=feature_extract_method,
                     ),
                     remove_columns=[c for c in ds.column_names if c not in keep_cols],
                     num_proc=num_proc,
-                    desc=f"multi_doc_qa {ratio}{desc_suffix}",
+                    desc=f"multi_context_qa {ratio}{desc_suffix}",
                 )
             elif task == "text_reconstruct":
                 ds_out = ds.map(
                     lambda e: encode_text_reconstruction(
                         e,
                         tokenizer_decoder=tokenizer_decoder,
-                        num_doc_tokens=ratio,
+                        comp_ratio_or_len=ratio,
                         placeholder_token=placeholder_token,
                         feature_extract_method=feature_extract_method,
                     ),
@@ -369,7 +461,7 @@ def load_from_data_config(
                     lambda e: encode_qa_and_sum(
                         e,
                         tokenizer_decoder=tokenizer_decoder,
-                        num_doc_tokens=ratio,
+                        comp_ratio_or_len=ratio,
                         placeholder_token=placeholder_token,
                         feature_extract_method=feature_extract_method,
                     ),
@@ -379,7 +471,7 @@ def load_from_data_config(
                 )
             return ds_out.filter(lambda x: min_length <= len(x["input_ids"]) <= max_length, num_proc=num_proc)
 
-        result = _encode_gen(ds_doc, comp_ratio_or_len)
+        result = _encode_gen(ds_ctx, comp_ratio_or_len)
         if len(result) > 0:
             ds_list.append(result)
 

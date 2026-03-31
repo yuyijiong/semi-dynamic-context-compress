@@ -1,7 +1,7 @@
 """
 Context compression models: CtxCompModel and CtxCompSemiDynamicModel.
 
-Encoder compresses a long document into a fixed or variable number of vectors;
+Encoder compresses a long context into a fixed or variable number of vectors;
 a projector (MLP) maps them to the decoder's hidden space; the decoder generates
 with these vectors injected at placeholder token positions in the query/prompt.
 
@@ -23,7 +23,7 @@ from transformers.activations import GELUActivation
 from peft import PeftModel, LoraConfig, get_peft_model
 
 # Feature extraction methods that interpret comp_ratio_or_len as a ratio in (0, 1].
-# For these, compression length M is derived from document length L (e.g. M = ceil(L * ratio) or pool_size = 1/ratio).
+# For these, compression length M is derived from context length L (e.g. M = ceil(L * ratio) or pool_size = 1/ratio).
 RATIO_BASED_FEATURE_EXTRACT_METHODS = ("mean_pooling", "mean_pooling_causal")
 
 # All allowed values for feature_extract_method. Others (e.g. last_tokens, same_memory_tokens)
@@ -158,19 +158,19 @@ def _comp_ratio_or_len_to_serializable(
 
 
 def _last_content_indices_from_attention_mask(
-    doc_attention_mask: Optional[torch.Tensor],
+    context_attention_mask: Optional[torch.Tensor],
     L_per_sample: torch.Tensor,
     device: torch.device,
 ) -> torch.Tensor:
     """
     Index of last 1 in attention_mask per sample (left-padding safe).
-    If doc_attention_mask is None, returns L_per_sample - 1.
+    If context_attention_mask is None, returns L_per_sample - 1.
     Returns [batch_size] long tensor.
     """
-    if doc_attention_mask is not None:
-        seq_len = doc_attention_mask.shape[1]
+    if context_attention_mask is not None:
+        seq_len = context_attention_mask.shape[1]
         return (
-            doc_attention_mask.long()
+            context_attention_mask.long()
             * torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0)
         ).max(dim=1)[1]
     return L_per_sample - 1
@@ -254,9 +254,9 @@ class CtxCompModel(nn.Module):
     """
     Context compression model with fixed compression length or ratio.
 
-    Flow: document -> encoder -> extract features (by feature_extract_method) -> projector -> decoder.
+    Flow: context -> encoder -> extract features (by feature_extract_method) -> projector -> decoder.
     The decoder's input sequence contains placeholder token(s); those positions are replaced by
-    the projected document features. You can train encoder/decoder (full or LoRA) and the projector.
+    the projected context features. You can train encoder/decoder (full or LoRA) and the projector.
 
     Supported feature_extract_method and comp_ratio_or_len semantics:
     - "last_tokens": comp_ratio_or_len = int M; use last M token hidden states.
@@ -281,10 +281,10 @@ class CtxCompModel(nn.Module):
     ):
         """
         Args:
-            encoder: Backbone for encoding the document (e.g. AutoModel or PeftModel).
+            encoder: Backbone for encoding the context (e.g. AutoModel or PeftModel).
                 Output last_hidden_state is used to extract compressed features.
             decoder: Causal LM for generation (e.g. AutoModelForCausalLM or PeftModel).
-                Receives inputs_embeds where placeholder positions are replaced by projected doc features.
+                Receives inputs_embeds where placeholder positions are replaced by projected context features.
             placeholder_token_id: Token id used in the decoder input to mark where compressed context
                 should be injected. The number of placeholders per sample must match the number of
                 compressed tokens M for that sample (or comp_ratio_or_len when fixed).
@@ -306,7 +306,7 @@ class CtxCompModel(nn.Module):
             encoder_training: How to train the encoder: "full" (all params), "lora", or "none" (frozen).
             decoder_training: How to train the decoder: "full", "lora", or "none".
             encoder_each_layer_sliding_window: Optional list of sliding window sizes, one per encoder layer.
-                Length must equal encoder number of layers. Used to limit attention span per layer (e.g. for long docs).
+                Length must equal encoder number of layers. Used to limit attention span per layer (e.g. for long contexts).
                 None means do not modify encoder attention.
         """
         super().__init__()
@@ -411,61 +411,61 @@ class CtxCompModel(nn.Module):
     def replace_placeholder_tokens(
         self,
         input_ids: torch.Tensor,
-        compressed_doc_features: torch.Tensor,
-        doc_valid_mask: torch.Tensor,
-        doc_attention_mask: Optional[torch.Tensor] = None,
-        doc_input_ids: Optional[torch.Tensor] = None,
+        compressed_context_features: torch.Tensor,
+        context_valid_mask: torch.Tensor,
+        context_attention_mask: Optional[torch.Tensor] = None,
+        context_input_ids: Optional[torch.Tensor] = None,
         comp_ratio_or_len_override: Optional[Union[int, float]] = None,
     ):
         """
-        Replace placeholder positions in input_ids with compressed_doc_features.
+        Replace placeholder positions in input_ids with compressed_context_features.
 
         Args:
             input_ids: [batch_size, seq_len] decoder input containing placeholder_token_id.
-            compressed_doc_features: [batch_size, M_or_max, hidden_dim] projected document features.
-            doc_valid_mask: [batch_size, M_or_max] True where the feature is valid (per-sample M may differ).
+            compressed_context_features: [batch_size, M_or_max, hidden_dim] projected context features.
+            context_valid_mask: [batch_size, M_or_max] True where the feature is valid (per-sample M may differ).
                 For each sample, the number of True must equal the number of placeholder_token_id in input_ids.
-            doc_attention_mask: Optional; used only for error messages (context length).
-            doc_input_ids: Optional; used only for error messages (max doc length).
+            context_attention_mask: Optional; used only for error messages (context length).
+            context_input_ids: Optional; used only for error messages (max context token length).
             comp_ratio_or_len_override: Optional; used only for error messages.
 
         Returns:
-            inputs_embeds: [batch_size, seq_len, hidden_dim] with placeholders replaced by compressed_doc_features.
+            inputs_embeds: [batch_size, seq_len, hidden_dim] with placeholders replaced by compressed_context_features.
         """
         inputs_embeds = self.decoder.get_input_embeddings()(input_ids)
         placeholder_mask = (input_ids == self.placeholder_token_id)
         n_placeholder_tokens = placeholder_mask.sum(dim=1)
-        num_valid_tokens = doc_valid_mask.sum(dim=1)
-        hidden_dim = compressed_doc_features.shape[-1]
+        num_valid_tokens = context_valid_mask.sum(dim=1)
+        hidden_dim = compressed_context_features.shape[-1]
 
         for i in range(input_ids.shape[0]):
             if n_placeholder_tokens[i].item() != num_valid_tokens[i].item():
                 used = comp_ratio_or_len_override if comp_ratio_or_len_override is not None else getattr(self, "comp_ratio_or_len", None)
                 ctx_valid_len = (
-                    doc_attention_mask[i].sum().item()
-                    if doc_attention_mask is not None and i < doc_attention_mask.shape[0]
+                    context_attention_mask[i].sum().item()
+                    if context_attention_mask is not None and i < context_attention_mask.shape[0]
                     else None
                 )
-                batch_max_doc_len = doc_input_ids.shape[1] if doc_input_ids is not None else None
+                batch_max_context_len = context_input_ids.shape[1] if context_input_ids is not None else None
                 extra = [
                     f"comp_ratio_or_len={used}",
                     f"sample_{i}_context_valid_len={ctx_valid_len}" if ctx_valid_len is not None else "sample_{i}_context_valid_len=N/A",
-                    f"batch_max_doc_len={batch_max_doc_len}" if batch_max_doc_len is not None else "batch_max_doc_len=N/A",
+                    f"batch_max_context_len={batch_max_context_len}" if batch_max_context_len is not None else "batch_max_context_len=N/A",
                 ]
                 raise ValueError(
                     f"Sample {i}: placeholder count {n_placeholder_tokens[i].item()} must equal "
-                    f"doc valid count {num_valid_tokens[i].item()} (id={self.placeholder_token_id}). Debug: {', '.join(extra)}"
+                    f"context feature count {num_valid_tokens[i].item()} (id={self.placeholder_token_id}). Debug: {', '.join(extra)}"
                 )
 
-        compressed_flat = compressed_doc_features[doc_valid_mask].reshape(-1)
+        compressed_flat = compressed_context_features[context_valid_mask].reshape(-1)
         placeholder_mask_expanded = placeholder_mask.unsqueeze(-1).expand_as(inputs_embeds)
         inputs_embeds = inputs_embeds.masked_scatter(placeholder_mask_expanded, compressed_flat)
         return inputs_embeds
 
-    def _prepare_doc_encoder_inputs(
+    def _prepare_context_encoder_inputs(
         self,
-        doc_input_ids: torch.Tensor,
-        doc_attention_mask: Optional[torch.Tensor],
+        context_input_ids: torch.Tensor,
+        context_attention_mask: Optional[torch.Tensor],
         batch_size: int,
         device: torch.device,
         comp_ratio_or_len_arg: Optional[Union[int, float, Tuple, List]] = None,
@@ -474,15 +474,15 @@ class CtxCompModel(nn.Module):
         Prepare encoder input; append memory tokens for memory_tokens methods.
         Returns (model_input_ids, model_attention_mask, L_per_sample [B]).
         """
-        seq_len = doc_input_ids.shape[1]
-        if doc_attention_mask is not None:
-            L_per_sample = doc_attention_mask.sum(dim=1).clamp(min=1).long()
+        seq_len = context_input_ids.shape[1]
+        if context_attention_mask is not None:
+            L_per_sample = context_attention_mask.sum(dim=1).clamp(min=1).long()
         else:
             L_per_sample = torch.full((batch_size,), seq_len, dtype=torch.long, device=device)
 
         is_memory = self.feature_extract_method in ("same_memory_tokens", "different_memory_tokens")
         if not is_memory:
-            return doc_input_ids, doc_attention_mask, L_per_sample
+            return context_input_ids, context_attention_mask, L_per_sample
 
         effective = comp_ratio_or_len_arg if comp_ratio_or_len_arg is not None else self.comp_ratio_or_len
         max_mem = int(effective) if not isinstance(effective, (tuple, list)) else max(int(x) for x in effective)
@@ -491,22 +491,22 @@ class CtxCompModel(nn.Module):
             if self.feature_extract_method == "same_memory_tokens":
                 memory_tokens = torch.full(
                     (batch_size, max_mem), self.memory_token_begin_id,
-                    dtype=doc_input_ids.dtype, device=device,
+                    dtype=context_input_ids.dtype, device=device,
                 )
             else:
                 memory_tokens = torch.tensor(
                     list(range(self.memory_token_begin_id, self.memory_token_begin_id + max_mem)),
-                    dtype=doc_input_ids.dtype, device=device,
+                    dtype=context_input_ids.dtype, device=device,
                 ).unsqueeze(0).repeat(batch_size, 1)
-            model_input_ids = torch.cat([doc_input_ids, memory_tokens], dim=1)
-            if doc_attention_mask is not None:
-                memory_mask = torch.ones((batch_size, max_mem), dtype=doc_attention_mask.dtype, device=device)
-                model_attention_mask = torch.cat([doc_attention_mask, memory_mask], dim=1)
+            model_input_ids = torch.cat([context_input_ids, memory_tokens], dim=1)
+            if context_attention_mask is not None:
+                memory_mask = torch.ones((batch_size, max_mem), dtype=context_attention_mask.dtype, device=device)
+                model_attention_mask = torch.cat([context_attention_mask, memory_mask], dim=1)
             else:
                 model_attention_mask = torch.ones_like(model_input_ids)
         return model_input_ids, model_attention_mask, L_per_sample
 
-    def _get_doc_encoder_last_hidden(
+    def _get_context_encoder_last_hidden(
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
@@ -514,17 +514,16 @@ class CtxCompModel(nn.Module):
         """Run encoder and return last_hidden_state. Handles shared base model (adapter switch + CausalLM backbone)."""
         self._switch_encoder_adapter()
         model = self.encoder
-        if self._shared_base_model and hasattr(model, "model"):
-            outputs = model.model(input_ids=input_ids, attention_mask=attention_mask,use_cache=False)
-        else:
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask,use_cache=False)
+
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask,use_cache=False,output_hidden_states=True)
+
         if hasattr(outputs, "last_hidden_state"):
             return outputs.last_hidden_state
         if hasattr(outputs, "hidden_states") and outputs.hidden_states:
             return outputs.hidden_states[-1]
         raise AttributeError("Encoder output has no last_hidden_state or hidden_states")
 
-    def _extract_doc_features_from_last_hidden_last_tokens(
+    def _extract_context_features_from_last_hidden_last_tokens(
         self,
         last_hidden: torch.Tensor,
         L_max: int,
@@ -543,10 +542,10 @@ class CtxCompModel(nn.Module):
             last_hidden, 1,
             safe_indices.unsqueeze(-1).expand(-1, -1, last_hidden.shape[-1]),
         )
-        doc_features = gathered * valid_mask.unsqueeze(-1).to(dtype=gathered.dtype)
-        return doc_features, valid_mask
+        context_features = gathered * valid_mask.unsqueeze(-1).to(dtype=gathered.dtype)
+        return context_features, valid_mask
 
-    def _extract_doc_features_from_last_hidden_memory_tokens(
+    def _extract_context_features_from_last_hidden_memory_tokens(
         self,
         last_hidden: torch.Tensor,
         L_per_sample: torch.Tensor,
@@ -564,10 +563,10 @@ class CtxCompModel(nn.Module):
             last_hidden, 1,
             safe_indices.unsqueeze(-1).expand(-1, -1, last_hidden.shape[-1]),
         )
-        doc_features = gathered * valid_mask.unsqueeze(-1).to(dtype=gathered.dtype)
-        return doc_features, valid_mask
+        context_features = gathered * valid_mask.unsqueeze(-1).to(dtype=gathered.dtype)
+        return context_features, valid_mask
 
-    def _extract_doc_features_from_last_hidden_mean_pooling(
+    def _extract_context_features_from_last_hidden_mean_pooling(
         self,
         last_hidden: torch.Tensor,
         L_max: int,
@@ -598,13 +597,13 @@ class CtxCompModel(nn.Module):
         count_flat.index_add_(0, active_indices, torch.ones(active_source.shape[0], 1, device=device, dtype=last_hidden.dtype))
         count_flat = count_flat.clamp(min=1.0)
         output_flat = output_flat / count_flat
-        doc_features = output_flat.view(batch_size, max_M, -1)
+        context_features = output_flat.view(batch_size, max_M, -1)
         feature_idx = torch.arange(max_M, device=device).unsqueeze(0)
-        doc_valid_mask = feature_idx >= (max_M - M_per_sample.unsqueeze(1))
-        doc_features = doc_features * doc_valid_mask.unsqueeze(-1).to(dtype=doc_features.dtype)
-        return doc_features, doc_valid_mask
+        context_valid_mask = feature_idx >= (max_M - M_per_sample.unsqueeze(1))
+        context_features = context_features * context_valid_mask.unsqueeze(-1).to(dtype=context_features.dtype)
+        return context_features, context_valid_mask
 
-    def _extract_doc_features_from_last_hidden_mean_pooling_fixed_pool_size(
+    def _extract_context_features_from_last_hidden_mean_pooling_fixed_pool_size(
         self,
         last_hidden: torch.Tensor,
         L_max: int,
@@ -631,75 +630,75 @@ class CtxCompModel(nn.Module):
             padding = torch.zeros(batch_size, pad_len, hidden_dim, dtype=last_hidden.dtype, device=device)
             content = torch.cat([padding, content], dim=1)
         max_M = target_len // pool_size
-        doc_features = content.view(batch_size, max_M, pool_size, hidden_dim).mean(dim=2)
+        context_features = content.view(batch_size, max_M, pool_size, hidden_dim).mean(dim=2)
         M_per_sample = ((L_per_sample + pool_size - 1) // pool_size).clamp(min=1)
-        doc_valid_mask = torch.arange(max_M, device=device).unsqueeze(0) >= (max_M - M_per_sample.unsqueeze(1))
-        doc_features = doc_features * doc_valid_mask.unsqueeze(-1).to(dtype=doc_features.dtype)
-        return doc_features, doc_valid_mask
+        context_valid_mask = torch.arange(max_M, device=device).unsqueeze(0) >= (max_M - M_per_sample.unsqueeze(1))
+        context_features = context_features * context_valid_mask.unsqueeze(-1).to(dtype=context_features.dtype)
+        return context_features, context_valid_mask
 
-    def get_doc_features(
+    def get_context_features(
         self,
-        doc_input_ids: torch.Tensor,
-        doc_attention_mask: Optional[torch.Tensor] = None,
+        context_input_ids: torch.Tensor,
+        context_attention_mask: Optional[torch.Tensor] = None,
         return_last_hidden_state: bool = False,
     ):
         """
-        Extract compressed document features from the encoder.
+        Extract compressed context features from the encoder.
 
         Args:
-            doc_input_ids: [batch_size, doc_len] token ids of the document.
-            doc_attention_mask: Optional [batch_size, doc_len]; 1 for valid tokens. Used for per-sample length
+            context_input_ids: [batch_size, context_len] token ids of the context.
+            context_attention_mask: Optional [batch_size, context_len]; 1 for valid tokens. Used for per-sample length
                 when using ratio-based or variable-length methods.
             return_last_hidden_state: If True, return a third value: encoder last_hidden_state [B, seq, embed_dim].
 
         Returns:
-            doc_features: [batch_size, M_or_max, embed_dim] encoder-space compressed vectors.
-            doc_valid_mask: [batch_size, M_or_max] True for valid positions (right-aligned when M varies).
+            context_features: [batch_size, M_or_max, embed_dim] encoder-space compressed vectors.
+            context_valid_mask: [batch_size, M_or_max] True for valid positions (right-aligned when M varies).
             Optionally last_hidden_state when return_last_hidden_state=True.
         """
-        batch_size = doc_input_ids.shape[0]
-        device = doc_input_ids.device
-        seq_len = doc_input_ids.shape[1]
+        batch_size = context_input_ids.shape[0]
+        device = context_input_ids.device
+        seq_len = context_input_ids.shape[1]
 
         ratio_based = self.feature_extract_method in RATIO_BASED_FEATURE_EXTRACT_METHODS
         n_tokens = _comp_ratio_or_len_to_capacity(self.comp_ratio_or_len) if not ratio_based else None
         if n_tokens is not None and seq_len < n_tokens:
             raise ValueError(f"seq_len ({seq_len}) must be >= comp_ratio_or_len capacity ({n_tokens})")
 
-        def _return_two_or_three(doc_features, doc_valid_mask, last_hidden):
+        def _return_two_or_three(ctx_feats, ctx_mask, last_hidden):
             if return_last_hidden_state:
-                return doc_features, doc_valid_mask, last_hidden
-            return doc_features, doc_valid_mask
+                return ctx_feats, ctx_mask, last_hidden
+            return ctx_feats, ctx_mask
 
-        model_input_ids, model_attention_mask, L_per_sample = self._prepare_doc_encoder_inputs(
-            doc_input_ids, doc_attention_mask, batch_size, device,
+        model_input_ids, model_attention_mask, L_per_sample = self._prepare_context_encoder_inputs(
+            context_input_ids, context_attention_mask, batch_size, device,
         )
-        last_hidden = self._get_doc_encoder_last_hidden(model_input_ids, model_attention_mask)
+        last_hidden = self._get_context_encoder_last_hidden(model_input_ids, model_attention_mask)
         L_max = last_hidden.shape[1]
 
         if self.feature_extract_method == "last_tokens":
             n = int(self.comp_ratio_or_len)
             M_per_sample = torch.full((batch_size,), n, dtype=torch.long, device=device)
             max_M = n
-            df, dm = self._extract_doc_features_from_last_hidden_last_tokens(
+            ctx_feats, ctx_mask = self._extract_context_features_from_last_hidden_last_tokens(
                 last_hidden, L_max, L_per_sample, M_per_sample, max_M, batch_size, device,
             )
-            return _return_two_or_three(df, dm, last_hidden)
+            return _return_two_or_three(ctx_feats, ctx_mask, last_hidden)
         if self.feature_extract_method in ("same_memory_tokens", "different_memory_tokens"):
             n = int(self.comp_ratio_or_len)
             M_per_sample = torch.full((batch_size,), n, dtype=torch.long, device=device)
             max_M = n
-            df, dm = self._extract_doc_features_from_last_hidden_memory_tokens(
+            ctx_feats, ctx_mask = self._extract_context_features_from_last_hidden_memory_tokens(
                 last_hidden, L_per_sample, M_per_sample, max_M, batch_size, device,
             )
-            return _return_two_or_three(df, dm, last_hidden)
+            return _return_two_or_three(ctx_feats, ctx_mask, last_hidden)
         if self.feature_extract_method in ("mean_pooling", "mean_pooling_causal"):
             ratio = float(self.comp_ratio_or_len)
             pool_size = max(1, round(1 / ratio))
-            df, dm = self._extract_doc_features_from_last_hidden_mean_pooling_fixed_pool_size(
+            ctx_feats, ctx_mask = self._extract_context_features_from_last_hidden_mean_pooling_fixed_pool_size(
                 last_hidden, L_max, L_per_sample, pool_size, batch_size, device,
             )
-            return _return_two_or_three(df, dm, last_hidden)
+            return _return_two_or_three(ctx_feats, ctx_mask, last_hidden)
         raise ValueError(
             f"Unsupported feature_extract_method: {self.feature_extract_method}. "
             f"Supported: {SUPPORTED_FEATURE_EXTRACT_METHODS}"
@@ -707,52 +706,52 @@ class CtxCompModel(nn.Module):
 
     def compute_inputs_embeds(
         self,
-        doc_input_ids: torch.Tensor,
+        context_input_ids: torch.Tensor,
         input_ids: torch.Tensor,
-        doc_attention_mask: Optional[torch.Tensor] = None,
+        context_attention_mask: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ):
         """
-        Compute decoder input embeddings with document context injected at placeholders.
+        Compute decoder input embeddings with compressed context injected at placeholders.
 
         Args:
-            doc_input_ids: Document token ids [batch_size, doc_len].
+            context_input_ids: Context token ids [batch_size, context_len].
             input_ids: Decoder query/prompt token ids [batch_size, seq_len], containing placeholder_token_id.
-            doc_attention_mask: Optional attention mask for the document.
+            context_attention_mask: Optional attention mask for the context sequence.
             attention_mask: Optional attention mask for the query (decoder).
 
         Returns:
             inputs_embeds: [batch_size, seq_len, hidden_dim] ready for decoder(inputs_embeds=..., attention_mask=...).
         """
-        doc_features, doc_valid_mask = self.get_doc_features(
-            doc_input_ids=doc_input_ids,
-            doc_attention_mask=doc_attention_mask,
+        context_features, context_valid_mask = self.get_context_features(
+            context_input_ids=context_input_ids,
+            context_attention_mask=context_attention_mask,
         )
-        compressed_doc_features = self.projector(doc_features)
+        compressed_context_features = self.projector(context_features)
         return self.replace_placeholder_tokens(
             input_ids=input_ids,
-            compressed_doc_features=compressed_doc_features,
-            doc_valid_mask=doc_valid_mask,
-            doc_attention_mask=doc_attention_mask,
-            doc_input_ids=doc_input_ids,
+            compressed_context_features=compressed_context_features,
+            context_valid_mask=context_valid_mask,
+            context_attention_mask=context_attention_mask,
+            context_input_ids=context_input_ids,
         )
 
     def forward(
         self,
-        doc_input_ids: torch.Tensor,
+        context_input_ids: torch.Tensor,
         input_ids: torch.Tensor,
-        doc_attention_mask: Optional[torch.Tensor] = None,
+        context_attention_mask: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         comp_ratio_or_len_override: Optional[Union[int, float]] = None,
     ):
         """
-        Forward pass: compress document, inject at placeholders, run decoder with optional labels.
+        Forward pass: compress context, inject at placeholders, run decoder with optional labels.
 
         Args:
-            doc_input_ids: Document token ids [batch_size, doc_len].
+            context_input_ids: Context token ids [batch_size, context_len].
             input_ids: Decoder input token ids [batch_size, seq_len] with placeholder_token_id.
-            doc_attention_mask: Optional document attention mask.
+            context_attention_mask: Optional context attention mask.
             attention_mask: Optional decoder attention mask.
             labels: Optional [batch_size, seq_len] for language modeling loss (-100 to ignore positions).
             comp_ratio_or_len_override: When the model has multiple comp_ratio_or_len options (tuple/list),
@@ -768,9 +767,9 @@ class CtxCompModel(nn.Module):
             self.comp_ratio_or_len = to_set
         try:
             inputs_embeds = self.compute_inputs_embeds(
-                doc_input_ids=doc_input_ids,
+                context_input_ids=context_input_ids,
                 input_ids=input_ids,
-                doc_attention_mask=doc_attention_mask,
+                context_attention_mask=context_attention_mask,
                 attention_mask=attention_mask,
             )
             self._switch_decoder_adapter()
@@ -823,21 +822,21 @@ class CtxCompModel(nn.Module):
 
     def generate(
         self,
-        doc_input_ids: torch.Tensor,
+        context_input_ids: torch.Tensor,
         input_ids: torch.Tensor,
-        doc_attention_mask: Optional[torch.Tensor] = None,
+        context_attention_mask: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         comp_ratio_or_len_override: Optional[Union[int, float]] = None,
         *args,
         **kwargs,
     ):
         """
-        Generate with compressed document context. Passes *args and **kwargs to decoder.generate.
+        Generate with compressed context. Passes *args and **kwargs to decoder.generate.
 
         Args:
-            doc_input_ids: Document token ids [batch_size, doc_len].
+            context_input_ids: Context token ids [batch_size, context_len].
             input_ids: Decoder prompt token ids [batch_size, seq_len] with placeholder_token_id.
-            doc_attention_mask: Optional document attention mask.
+            context_attention_mask: Optional context attention mask.
             attention_mask: Optional decoder attention mask for the prompt.
             comp_ratio_or_len_override: When model has multiple comp_ratio_or_len options, the value for this call.
 
@@ -852,8 +851,8 @@ class CtxCompModel(nn.Module):
         try:
             with torch.no_grad():
                 inputs_embeds = self.compute_inputs_embeds(
-                    doc_input_ids=doc_input_ids,
-                    doc_attention_mask=doc_attention_mask,
+                    context_input_ids=context_input_ids,
+                    context_attention_mask=context_attention_mask,
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                 )
@@ -1030,7 +1029,7 @@ class CtxCompModel(nn.Module):
             json.dump(self._get_save_config(), f, indent=4)
 
     @classmethod
-    def from_pretrained(cls, path: str, share_base_model_inference: bool = False, **kwargs):
+    def from_pretrained(cls, path: str, share_base_model_inference: bool = True, **kwargs):
         """
         Load model from a directory saved by save_pretrained.
 
@@ -1351,17 +1350,17 @@ class CtxCompSemiDynamicModel(CtxCompModel):
         out_flat = candidates[min_idx]
         return out_flat.view_as(values)
 
-    def _get_doc_valid_lengths(
+    def _get_context_valid_lengths(
         self,
-        doc_input_ids: torch.Tensor,
-        doc_attention_mask: Optional[torch.Tensor],
+        context_input_ids: torch.Tensor,
+        context_attention_mask: Optional[torch.Tensor],
         batch_size: int,
         device: torch.device,
     ) -> torch.Tensor:
-        """Per-sample valid document length L from doc_attention_mask."""
-        L_max = doc_input_ids.shape[1]
-        if doc_attention_mask is not None:
-            return doc_attention_mask.sum(dim=1).clamp(min=1)
+        """Per-sample valid context length L from context_attention_mask."""
+        L_max = context_input_ids.shape[1]
+        if context_attention_mask is not None:
+            return context_attention_mask.sum(dim=1).clamp(min=1)
         return torch.full((batch_size,), L_max, dtype=torch.long, device=device)
 
     def _get_max_memory_slots(self) -> int:
@@ -1374,62 +1373,62 @@ class CtxCompSemiDynamicModel(CtxCompModel):
         vocab_size = embed_tokens.weight.shape[0]
         return max(0, vocab_size - self.memory_token_begin_id)
 
-    def get_doc_features(
+    def get_context_features(
         self,
-        doc_input_ids: torch.Tensor,
-        doc_attention_mask: Optional[torch.Tensor] = None,
+        context_input_ids: torch.Tensor,
+        context_attention_mask: Optional[torch.Tensor] = None,
         comp_ratio_or_len_override: Optional[Union[int, float]] = None,
         compress_ratio_scale: float = 0,
     ):
         """
-        Extract document features; M is either fixed (override) or predicted by compress_ratio_head and discretized.
+        Extract context features; M is either fixed (override) or predicted by compress_ratio_head and discretized.
 
         Args:
-            doc_input_ids: Document token ids [batch_size, doc_len].
-            doc_attention_mask: Optional; required for per-sample length when M is predicted.
+            context_input_ids: Context token ids [batch_size, context_len].
+            context_attention_mask: Optional; required for per-sample length when M is predicted.
             comp_ratio_or_len_override: If set, use this as fixed M (same as base class). If None, M is
                 predicted from the last token hidden state and discretized to comp_ratio_or_len options.
             compress_ratio_scale: Added to the head output (log space) before discretization. Use to shift
                 predicted compression ratio at inference without retraining (e.g. 0.5 for more compression).
 
         Returns:
-            doc_features: [batch_size, max_M, embed_dim].
-            doc_valid_mask: [batch_size, max_M] True for valid positions.
+            context_features: [batch_size, max_M, embed_dim].
+            context_valid_mask: [batch_size, max_M] True for valid positions.
             predicted_compress_ratio: [batch_size, 1] head output (log space); used for comp_ratio_loss when labels given.
         """
         if comp_ratio_or_len_override is not None:
-            batch_size = doc_input_ids.shape[0]
-            device = doc_input_ids.device
+            batch_size = context_input_ids.shape[0]
+            device = context_input_ids.device
             _saved = self.comp_ratio_or_len
             self.comp_ratio_or_len = comp_ratio_or_len_override
             try:
-                doc_features, doc_valid_mask, last_hidden_state = super().get_doc_features(
-                    doc_input_ids=doc_input_ids,
-                    doc_attention_mask=doc_attention_mask,
+                context_features, context_valid_mask, last_hidden_state = super().get_context_features(
+                    context_input_ids=context_input_ids,
+                    context_attention_mask=context_attention_mask,
                     return_last_hidden_state=True,
                 )
             finally:
                 self.comp_ratio_or_len = _saved
-            L_per_sample = self._get_doc_valid_lengths(doc_input_ids, doc_attention_mask, batch_size, device)
-            last_content_idx = _last_content_indices_from_attention_mask(doc_attention_mask, L_per_sample, device)
+            L_per_sample = self._get_context_valid_lengths(context_input_ids, context_attention_mask, batch_size, device)
+            last_content_idx = _last_content_indices_from_attention_mask(context_attention_mask, L_per_sample, device)
             last_token_hidden = last_hidden_state[
                 torch.arange(batch_size, device=device), last_content_idx, :
             ]
             predicted_compress_ratio = self.compress_ratio_head(last_token_hidden) + compress_ratio_scale
-            return doc_features, doc_valid_mask, predicted_compress_ratio
+            return context_features, context_valid_mask, predicted_compress_ratio
 
-        batch_size = doc_input_ids.shape[0]
-        device = doc_input_ids.device
-        L_max = doc_input_ids.shape[1]
+        batch_size = context_input_ids.shape[0]
+        device = context_input_ids.device
+        L_max = context_input_ids.shape[1]
         is_memory = self.feature_extract_method in ("same_memory_tokens", "different_memory_tokens")
         is_mean_pooling = self.feature_extract_method in ("mean_pooling", "mean_pooling_causal")
 
         num_for_prepare = _comp_ratio_or_len_for_max_memory(self.comp_ratio_or_len)
-        model_input_ids, model_attention_mask, L_per_sample = self._prepare_doc_encoder_inputs(
-            doc_input_ids, doc_attention_mask, batch_size, device, comp_ratio_or_len_arg=num_for_prepare,
+        model_input_ids, model_attention_mask, L_per_sample = self._prepare_context_encoder_inputs(
+            context_input_ids, context_attention_mask, batch_size, device, comp_ratio_or_len_arg=num_for_prepare,
         )
-        last_hidden = self._get_doc_encoder_last_hidden(model_input_ids, model_attention_mask)
-        last_content_idx = _last_content_indices_from_attention_mask(doc_attention_mask, L_per_sample, device)
+        last_hidden = self._get_context_encoder_last_hidden(model_input_ids, model_attention_mask)
+        last_content_idx = _last_content_indices_from_attention_mask(context_attention_mask, L_per_sample, device)
         last_token_hidden = last_hidden[torch.arange(batch_size, device=device), last_content_idx, :]
         predicted_compress_ratio = self.compress_ratio_head(last_token_hidden) + compress_ratio_scale
         pred_log = predicted_compress_ratio.squeeze(1)
@@ -1457,27 +1456,27 @@ class CtxCompSemiDynamicModel(CtxCompModel):
         max_M = max(M_per_sample.max().item(), 1)
 
         if is_memory:
-            doc_features, doc_valid_mask = self._extract_doc_features_from_last_hidden_memory_tokens(
+            context_features, context_valid_mask = self._extract_context_features_from_last_hidden_memory_tokens(
                 last_hidden, L_per_sample, M_per_sample, max_M, batch_size, device,
             )
         elif is_mean_pooling:
             if pool_size_per_sample is None:
                 pool_size_per_sample = torch.ceil(L_per_sample.float() / M_per_sample.float()).long().clamp(min=1)
-            doc_features, doc_valid_mask = self._extract_doc_features_from_last_hidden_mean_pooling(
+            context_features, context_valid_mask = self._extract_context_features_from_last_hidden_mean_pooling(
                 last_hidden, L_max, L_per_sample, M_per_sample, pool_size_per_sample,
                 max_M, batch_size, device,
             )
         else:
-            doc_features, doc_valid_mask = self._extract_doc_features_from_last_hidden_last_tokens(
+            context_features, context_valid_mask = self._extract_context_features_from_last_hidden_last_tokens(
                 last_hidden, L_max, L_per_sample, M_per_sample, max_M, batch_size, device,
             )
-        return doc_features, doc_valid_mask, predicted_compress_ratio
+        return context_features, context_valid_mask, predicted_compress_ratio
 
     def replace_placeholder_tokens_expand_one(
         self,
         input_ids: torch.Tensor,
-        compressed_doc_features: torch.Tensor,
-        doc_valid_mask: torch.Tensor,
+        compressed_context_features: torch.Tensor,
+        context_valid_mask: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int], bool]:
         """Replace the single placeholder per sample with M positions. Returns (inputs_embeds, new_attention_mask, placeholder_pos, new_len_list, pad_on_right)."""
@@ -1500,7 +1499,7 @@ class CtxCompSemiDynamicModel(CtxCompModel):
         new_seq_list, new_mask_list = [], []
         for b in range(batch_size):
             p = int(placeholder_pos[b].item())
-            injected = compressed_doc_features[b][doc_valid_mask[b]]
+            injected = compressed_context_features[b][context_valid_mask[b]]
             M_b = injected.shape[0]
             prefix = base_embeds[b, :p]
             suffix = base_embeds[b, p + 1:]
@@ -1577,9 +1576,9 @@ class CtxCompSemiDynamicModel(CtxCompModel):
 
     def compute_inputs_embeds(
         self,
-        doc_input_ids: torch.Tensor,
+        context_input_ids: torch.Tensor,
         input_ids: torch.Tensor,
-        doc_attention_mask: Optional[torch.Tensor] = None,
+        context_attention_mask: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         comp_ratio_or_len_override: Optional[Union[int, float]] = None,
         compress_ratio_scale: float = 0,
@@ -1591,41 +1590,41 @@ class CtxCompSemiDynamicModel(CtxCompModel):
         Returns a 7-tuple: (inputs_embeds, attention_mask, placeholder_pos, num_valid_tokens, new_len_list,
         predicted_compress_ratio, pad_on_right_or_None). When override is set, placeholder_pos and related are None.
         """
-        doc_features, doc_valid_mask, predicted_compress_ratio = self.get_doc_features(
-            doc_input_ids=doc_input_ids,
-            doc_attention_mask=doc_attention_mask,
+        context_features, context_valid_mask, predicted_compress_ratio = self.get_context_features(
+            context_input_ids=context_input_ids,
+            context_attention_mask=context_attention_mask,
             comp_ratio_or_len_override=comp_ratio_or_len_override,
             compress_ratio_scale=compress_ratio_scale,
         )
-        compressed_doc_features = self.projector(doc_features)
+        compressed_context_features = self.projector(context_features)
 
         # if comp_ratio_or_len_override is not None, that means the fixed-ratio mode, so we use the parent class's replace_placeholder_tokens
         if comp_ratio_or_len_override is not None:
             inputs_embeds = super().replace_placeholder_tokens(
                 input_ids=input_ids,
-                compressed_doc_features=compressed_doc_features,
-                doc_valid_mask=doc_valid_mask,
-                doc_attention_mask=doc_attention_mask,
-                doc_input_ids=doc_input_ids,
+                compressed_context_features=compressed_context_features,
+                context_valid_mask=context_valid_mask,
+                context_attention_mask=context_attention_mask,
+                context_input_ids=context_input_ids,
                 comp_ratio_or_len_override=comp_ratio_or_len_override,
             )
             return inputs_embeds, attention_mask, None, None, None, predicted_compress_ratio, None
 
         # if comp_ratio_or_len_override is None, that means the dynamic-ratio mode, so we use the dynamic-ratio replace_placeholder_tokens
-        num_valid_tokens = doc_valid_mask.sum(dim=1)
+        num_valid_tokens = context_valid_mask.sum(dim=1)
         inputs_embeds, new_attention_mask, placeholder_pos, new_len_list, pad_on_right = self.replace_placeholder_tokens_expand_one(
             input_ids=input_ids,
-            compressed_doc_features=compressed_doc_features,
-            doc_valid_mask=doc_valid_mask,
+            compressed_context_features=compressed_context_features,
+            context_valid_mask=context_valid_mask,
             attention_mask=attention_mask,
         )
         return inputs_embeds, new_attention_mask, placeholder_pos, num_valid_tokens, new_len_list, predicted_compress_ratio, pad_on_right
 
     def forward(
         self,
-        doc_input_ids: torch.Tensor,
+        context_input_ids: torch.Tensor,
         input_ids: torch.Tensor,
-        doc_attention_mask: Optional[torch.Tensor] = None,
+        context_attention_mask: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         compress_len_labels: Optional[torch.Tensor] = None,
@@ -1637,8 +1636,8 @@ class CtxCompSemiDynamicModel(CtxCompModel):
         must contain exactly one placeholder per sample (expanded to M inside).
 
         Args:
-            doc_input_ids, input_ids, doc_attention_mask, attention_mask, comp_ratio_or_len_override,
-            compress_ratio_scale: Same as compute_inputs_embeds / get_doc_features.
+            context_input_ids, input_ids, context_attention_mask, attention_mask, comp_ratio_or_len_override,
+            compress_ratio_scale: Same as compute_inputs_embeds / get_context_features.
             labels: Optional LM labels; when using single-placeholder expansion, labels are expanded with -100 at injected positions.
             compress_len_labels: Optional [batch_size] or [batch_size, 1] = log2(context_length/summary_length).
                 If provided, comp_ratio_loss = MSE(predicted_compress_ratio, compress_len_labels) is added to the output loss.
@@ -1647,9 +1646,9 @@ class CtxCompSemiDynamicModel(CtxCompModel):
             Decoder output with optional "lm_loss", "comp_ratio_loss", "num_valid_tokens", and combined "loss".
         """
         inputs_embeds, out_attention_mask, placeholder_pos, num_valid_tokens, new_len_list, predicted_compress_ratio, pad_on_right = self.compute_inputs_embeds(
-            doc_input_ids=doc_input_ids,
+            context_input_ids=context_input_ids,
             input_ids=input_ids,
-            doc_attention_mask=doc_attention_mask,
+            context_attention_mask=context_attention_mask,
             attention_mask=attention_mask,
             comp_ratio_or_len_override=comp_ratio_or_len_override,
             compress_ratio_scale=compress_ratio_scale,
@@ -1693,9 +1692,9 @@ class CtxCompSemiDynamicModel(CtxCompModel):
 
     def generate(
         self,
-        doc_input_ids: torch.Tensor,
+        context_input_ids: torch.Tensor,
         input_ids: torch.Tensor,
-        doc_attention_mask: Optional[torch.Tensor] = None,
+        context_attention_mask: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         comp_ratio_or_len_override: Optional[Union[int, float]] = None,
         compress_ratio_scale: float = 0,
@@ -1708,9 +1707,9 @@ class CtxCompSemiDynamicModel(CtxCompModel):
         """
         with torch.no_grad():
             inputs_embeds, new_attention_mask, _, num_valid_tokens, _, _, _ = self.compute_inputs_embeds(
-                doc_input_ids=doc_input_ids,
+                context_input_ids=context_input_ids,
                 input_ids=input_ids,
-                doc_attention_mask=doc_attention_mask,
+                context_attention_mask=context_attention_mask,
                 attention_mask=attention_mask,
                 comp_ratio_or_len_override=comp_ratio_or_len_override,
                 compress_ratio_scale=compress_ratio_scale,

@@ -1,7 +1,7 @@
 # Semi-dynamic soft context compression
 
-This directory contains the implementation of our paper [Density-aware Soft Context Compression with Semi-Dynamic Compression Ratio ](https://arxiv.org/abs/2305.02220). 
-The model compresses long documents into a fixed or variable number of latent tokens and injects them into the decoder at placeholder token positions.
+This directory contains the implementation of our paper [Density-aware Soft Context Compression with Semi-Dynamic Compression Ratio ](https://arxiv.org/abs/2603.25926). 
+The model compresses long contexts into a fixed or variable number of latent tokens and injects them into the decoder at placeholder token positions.
 
 ## Files
 
@@ -51,7 +51,7 @@ from transformers import AutoTokenizer
 sys.path.insert(0, "/path/to/semi_dynamic_soft_context_compress")
 from modeling_ctxcomp import CtxCompModel, CtxCompSemiDynamicModel
 
-checkpoint_dir = "/path/to/your/checkpoint"  # e.g. qwen3-semi-dynamic-soft-context-compress/static/ctxcomp-encoder=qwen3-embedding-0.6b-lora-decoder=qwen3-0.6b-lora-doclen=1300to128-ratio=0.03125
+checkpoint_dir = "/path/to/your/checkpoint"  # e.g. qwen3-semi-dynamic-soft-context-compress/static/ctxcomp-encoder=qwen3-embedding-0.6b-lora-decoder=qwen3-0.6b-lora-contextlen=1300to128-ratio=0.03125
 
 with open(os.path.join(checkpoint_dir, "config.json"), "r") as f:
     config = json.load(f)
@@ -63,13 +63,13 @@ tokenizer_encoder = AutoTokenizer.from_pretrained(encoder_path, trust_remote_cod
 tokenizer_decoder = AutoTokenizer.from_pretrained(decoder_path, trust_remote_code=True)
 placeholder_token = tokenizer_decoder.convert_ids_to_tokens(placeholder_token_id)
 
-document = "Your long document text here..."
-question = "What is the main idea of the document?"
+context_text = "Your long context text here..."
+question = "What is the main idea of the context?"
 ```
 
 ### Option A: Fixed-ratio (CtxCompModel)
 
-Load a static or multi-ratio checkpoint; **you** set the compression length/ratio for this call via `comp_ratio_or_len_override`. The number of placeholders in the prompt must equal the resulting M (e.g. for ratio 0.25 with mean_pooling, M = ceil(doc_len / 4)).
+Load a static or multi-ratio checkpoint; **you** set the compression length/ratio for this call via `comp_ratio_or_len_override`. The number of placeholders in the prompt must equal the resulting M (e.g. for ratio 0.25 with mean_pooling, M = ceil(context_len / 4)).
 
 ```python
 model = CtxCompModel.from_pretrained(
@@ -79,14 +79,14 @@ model = CtxCompModel.from_pretrained(
     device_map="auto",
 ).eval()
 
-# Example: use ratio 0.25 for this call (yields M = ceil(doc_len/4) for mean_pooling)
+# Example: use ratio 0.25 for this call (yields M = ceil(context_len/4) for mean_pooling)
 comp_ratio_or_len_override = 0.25  # or an int, e.g. 32, for last_tokens / memory_tokens
-num_placeholders = 32  # must match M for this doc and comp_ratio_or_len_override
+num_placeholders = 32  # must match M for this context and comp_ratio_or_len_override
 
 prompt_text = f"Context: {placeholder_token * num_placeholders}\n\nQuestion: {question}"
-doc_encoded = tokenizer_encoder(document, return_tensors="pt", padding=True, truncation=True, max_length=2048)
-doc_input_ids = doc_encoded["input_ids"].to(model.decoder.device)
-doc_attention_mask = doc_encoded["attention_mask"].to(model.decoder.device)
+context_encoded = tokenizer_encoder(context_text, return_tensors="pt", padding=True, truncation=True, max_length=2048)
+context_input_ids = context_encoded["input_ids"].to(model.decoder.device)
+context_attention_mask = context_encoded["attention_mask"].to(model.decoder.device)
 
 messages = [{"role": "user", "content": prompt_text}]
 prompt_ids = tokenizer_decoder.apply_chat_template(
@@ -97,9 +97,9 @@ attention_mask = torch.ones_like(input_ids, device=input_ids.device)
 
 with torch.no_grad():
     out = model.generate(
-        doc_input_ids=doc_input_ids,
+        context_input_ids=context_input_ids,
         input_ids=input_ids,
-        doc_attention_mask=doc_attention_mask,
+        context_attention_mask=context_attention_mask,
         attention_mask=attention_mask,
         comp_ratio_or_len_override=comp_ratio_or_len_override,  # fixed ratio for this call
         max_new_tokens=256,
@@ -125,9 +125,9 @@ model = CtxCompSemiDynamicModel.from_pretrained(
 
 # One placeholder; model predicts M and expands internally
 prompt_text = f"Context: {placeholder_token}\n\nQuestion: {question}"
-doc_encoded = tokenizer_encoder(document, return_tensors="pt", padding=True, truncation=True, max_length=2048)
-doc_input_ids = doc_encoded["input_ids"].to(model.decoder.device)
-doc_attention_mask = doc_encoded["attention_mask"].to(model.decoder.device)
+context_encoded = tokenizer_encoder(context_text, return_tensors="pt", padding=True, truncation=True, max_length=2048)
+context_input_ids = context_encoded["input_ids"].to(model.decoder.device)
+context_attention_mask = context_encoded["attention_mask"].to(model.decoder.device)
 
 messages = [{"role": "user", "content": prompt_text}]
 prompt_ids = tokenizer_decoder.apply_chat_template(
@@ -141,9 +141,9 @@ compress_ratio_scale = 0.5
 
 with torch.no_grad():
     out = model.generate(
-        doc_input_ids=doc_input_ids,
+        context_input_ids=context_input_ids,
         input_ids=input_ids,
-        doc_attention_mask=doc_attention_mask,
+        context_attention_mask=context_attention_mask,
         attention_mask=attention_mask,
         compress_ratio_scale=compress_ratio_scale,
         max_new_tokens=256,

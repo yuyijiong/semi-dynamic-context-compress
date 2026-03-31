@@ -15,7 +15,6 @@ if _ROOT not in sys.path:
 
 import torch
 from transformers import (
-    TrainingArguments,
     Trainer,
     AutoTokenizer,
     Qwen3ForCausalLM,
@@ -41,22 +40,29 @@ from datasets.utils.logging import set_verbosity_error, disable_progress_bar
 #disable_progress_bar()
 
 from modeling_ctxcomp import CtxCompModel
+from sft_ctxcomp_train_config import (
+    add_ctxcomp_sft_cli_args,
+    build_ctxcomp_training_arguments,
+    format_comp_ratio_for_output_dir,
+)
 from dataset_utils_ctxcomp import (
+    DEFAULT_DATA_CONFIG,
     load_from_data_config,
     encode_qa_and_sum,
-    encode_multi_doc_qa,
+    encode_multi_context_qa,
     encode_text_reconstruction,
-    encode_doc,
-    build_multi_doc_context,
+    encode_context,
+    build_context_from_passages,
     rename_context,
 )
 
 _COLLATOR_EXCLUDE_KEYS = frozenset({"context_len"})
+_COLLATOR_CONTEXT_ENCODER_KEYS = frozenset({"context_input_ids", "context_attention_mask"})
 
 
 @dataclass
 class CtxCompDataCollator(DataCollatorForSeq2Seq):
-    """Collator for CtxComp: gen part right-padded, doc part left-padded; passes comp_ratio_or_len_override when present."""
+    """Collator for CtxComp: gen part right-padded, context encoder part left-padded; passes comp_ratio_or_len_override when present."""
     tokenizer_encoder: PreTrainedTokenizerBase = None
 
     def __call__(self, features: List[Dict[str, Any]], return_tensors=None) -> Dict[str, Any]:
@@ -64,32 +70,36 @@ class CtxCompDataCollator(DataCollatorForSeq2Seq):
             return_tensors = self.return_tensors
 
         gen_features = []
-        doc_features = []
+        context_encoder_features = []
         for feature in features:
-            gen_f = {k: v for k, v in feature.items() if not k.startswith("doc_") and k not in _COLLATOR_EXCLUDE_KEYS}
+            gen_f = {
+                k: v
+                for k, v in feature.items()
+                if k not in _COLLATOR_CONTEXT_ENCODER_KEYS and k not in _COLLATOR_EXCLUDE_KEYS
+            }
             gen_features.append(gen_f)
-            doc_f = {"input_ids": feature["doc_input_ids"], "attention_mask": feature["doc_attention_mask"]}
-            doc_features.append(doc_f)
+            ctx_pad_item = {"input_ids": feature["context_input_ids"], "attention_mask": feature["context_attention_mask"]}
+            context_encoder_features.append(ctx_pad_item)
 
         batch = super().__call__(gen_features, return_tensors=return_tensors)
 
         if self.tokenizer_encoder is None:
             raise ValueError("CtxCompDataCollator requires tokenizer_encoder.")
-        doc_batch = self.tokenizer_encoder.pad(
-            doc_features,
+        context_padded = self.tokenizer_encoder.pad(
+            context_encoder_features,
             padding=self.padding,
             max_length=self.max_length,
             pad_to_multiple_of=self.pad_to_multiple_of,
             return_tensors=return_tensors,
         )
-        batch["doc_input_ids"] = doc_batch["input_ids"]
-        batch["doc_attention_mask"] = doc_batch["attention_mask"]
+        batch["context_input_ids"] = context_padded["input_ids"]
+        batch["context_attention_mask"] = context_padded["attention_mask"]
 
         #确保已经pad_to_multiple_of
-        #assert batch["doc_input_ids"].shape[1] % self.pad_to_multiple_of == 0
+        #assert batch["context_input_ids"].shape[1] % self.pad_to_multiple_of == 0
 
-        if features and "num_doc_tokens_override" in features[0]:
-            batch["comp_ratio_or_len_override"] = features[0]["num_doc_tokens_override"]
+        if features and "comp_ratio_or_len_override" in features[0]:
+            batch["comp_ratio_or_len_override"] = features[0]["comp_ratio_or_len_override"]
 
         for key in _COLLATOR_EXCLUDE_KEYS:
             batch.pop(key, None)
@@ -338,23 +348,45 @@ class BucketedCtxCompTrainer(CtxCompTrainer):
         )
 
 
-def _int_or_float(s):
-    s = str(s).strip()
-    try:
-        return int(s)
-    except ValueError:
-        return float(s)
+STATIC_SFT_CLI_DEFAULTS = {
+    "comp_ratio_or_len": 0.25,
+    "encoder_base_model_path": "/share/models/Qwen3.5-0.8B",
+    "decoder_base_model_path": "/share/models/Qwen3.5-0.8B",
+    "mlp_converter_hidden_dim": 4096,
+    "placeholder_id": 248076,
+    "memory_token_begin_id": 247000,
+    "feature_extract_method": "mean_pooling",
+    "encoder_training": "lora",
+    "decoder_training": "lora",
+    "context_max_length": 1034,
+    "context_min_length": 64,
+    "decoder_max_length": 1024,
+    "decoder_min_length": 1,
+    "dataset_num_proc": 40,
+    "dataset_exclude_sign": "eval",
+    "template_dir": ".",
+    "add_eos_token_to_context": True,
+    "use_gradient_checkpointing": False,
+    "per_device_train_batch_size": 10,
+    "max_steps": 40000,
+    "gradient_accumulation_steps": 1,
+    "learning_rate": 4e-5,
+    "warmup_steps": 100,
+    "eval_steps": 500,
+    "save_steps": 10000,
+    "save_total_limit": 3,
+    "logging_steps": 20,
+    "lr_scheduler_type": "constant_with_warmup",
+    "seed": 0,
+    "group_by_length": True,
+    "num_buckets": 10,
+    "collator_pad_to_multiple_of": None,
+}
 
 
 def main():
     parser = argparse.ArgumentParser(description="Train CtxCompModel (static)")
-    parser.add_argument("--comp_ratio_or_len", type=_int_or_float, default=0.25, help="Compression ratio (0,1] or int length")
-    parser.add_argument("--doc_max_length", type=int, default=1034)
-    parser.add_argument("--doc_min_length", type=int, default=64)
-    parser.add_argument("--feature_extract_method", type=str, default="mean_pooling",
-                        choices=["mean_pooling", "mean_pooling_causal", "last_tokens", "same_memory_tokens", "different_memory_tokens"])
-    parser.add_argument("--encoder_training", type=str, default="lora")
-    parser.add_argument("--decoder_training", type=str, default="lora")
+    add_ctxcomp_sft_cli_args(parser, STATIC_SFT_CLI_DEFAULTS)
     args = parser.parse_args()
 
     if torch.distributed.is_initialized():
@@ -365,126 +397,56 @@ def main():
         except Exception:
             pass
 
-    GROUP_BY_LENGTH = True
-    comp_ratio_or_len = args.comp_ratio_or_len
-    decoder_max_length = 1024
-    decoder_min_length = 1
-    doc_max_length = args.doc_max_length
-    doc_min_length = args.doc_min_length
-    placeholder_id = 248076#151656
-    memory_token_begin_id = 247000#150000
-    feature_extract_method = args.feature_extract_method
-    encoder_training = args.encoder_training
-    decoder_training = args.decoder_training
-    use_gradient_checkpointing = False
-
-    encoder_path = "/share/models/Qwen3.5-0.8B"
-    decoder_path = "/share/models/Qwen3.5-0.8B"
-
-
     output_dir = (
-        f"./training_output/ctxcomp-static-{feature_extract_method}-doclen={doc_max_length}to{doc_min_length}-"
-        f"comp={comp_ratio_or_len}-enc={pathlib.Path(encoder_path).name}-{encoder_training}-dec={pathlib.Path(decoder_path).name}-{decoder_training}"
+        f"./training_output/ctxcomp-static-{args.feature_extract_method}-contextlen={args.context_max_length}to{args.context_min_length}-"
+        f"comp={format_comp_ratio_for_output_dir(args.comp_ratio_or_len)}-enc={pathlib.Path(args.encoder_base_model_path).name}-{args.encoder_training}-dec={pathlib.Path(args.decoder_base_model_path).name}-{args.decoder_training}"
     )
-    train_args = TrainingArguments(
-        report_to="wandb",
+    train_args = build_ctxcomp_training_arguments(
+        args,
         output_dir=output_dir,
-        run_name=output_dir,
-        optim="adamw_torch",
-        learning_rate=4e-5,
-        lr_scheduler_type="constant_with_warmup",
-        warmup_steps=100,
-        max_steps=40000,
-        eval_steps=500,
-        eval_strategy="no",
-        save_steps=10000,
-        save_strategy="steps",
-        per_device_train_batch_size=10,
-        gradient_accumulation_steps=1,
-        logging_steps=20,
-        bf16=True,
-        fp16=False,
-        seed=0,
-        save_total_limit=3,
-        torch_compile=False,
-        ddp_find_unused_parameters=not use_gradient_checkpointing,
-        max_grad_norm=1.0,
+        ddp_find_unused_parameters=not args.use_gradient_checkpointing,
         gradient_checkpointing=False,
-        dataloader_drop_last=True,
     )
 
-    data_config = [
-        {"dir": "../数据合成/doc_sum_qa_shortsum_synthetic_text_128_en/Qwen3-30B-A3B-Instruct-2507__vllm",
-         "task": "qa_and_sum", "max_files": 50, "max_samples": 1000000},
-        {
-            "dir": "/share/yyj/edge_memory/数据合成/doc_sum_qa_shortsum_synthetic_text_128_zh/Qwen3-30B-A3B-Instruct-2507__vllm",
-            "task": "qa_and_sum", "max_files": 50, "max_samples": 750000},
-        {
-            "dir": "/share/yyj/edge_memory/数据合成/doc_sum_qa_shortsum_synthetic_text_256_en/Qwen3-30B-A3B-Instruct-2507__vllm",
-            "task": "qa_and_sum", "max_files": 50, "max_samples": 1000000},
-        {
-            "dir": "/share/yyj/edge_memory/数据合成/doc_sum_qa_shortsum_synthetic_text_256_zh/Qwen3-30B-A3B-Instruct-2507__vllm",
-            "task": "qa_and_sum", "max_files": 50, "max_samples": 750000},
-        {
-            "dir": "/share/yyj/edge_memory/数据合成/doc_sum_qa_shortsum_synthetic_text_512_en/Qwen3-30B-A3B-Instruct-2507__vllm",
-            "task": "qa_and_sum", "max_files": 50, "max_samples": 1000000},
-        {
-            "dir": "/share/yyj/edge_memory/数据合成/doc_sum_qa_shortsum_synthetic_text_512_en/Qwen3-30B-A3B-Instruct-2507__vllm",
-            "task": "qa_and_sum", "max_files": 50, "max_samples": 750000},
-        {
-            "dir": "/share/yyj/edge_memory/数据合成/doc_complex_qa_shortsum_synthetic_text_1024_en/Qwen3-30B-A3B-Instruct-2507__vllm",
-            "task": "qa_and_sum", "max_files": 50, "max_samples": 1000000},
-        {
-            "dir": "/share/yyj/edge_memory/数据合成/doc_complex_qa_shortsum_synthetic_text_1024_zh/Qwen3-30B-A3B-Instruct-2507__vllm",
-            "task": "qa_and_sum", "max_files": 50, "max_samples": 750000},
-        {
-            "dir": "/share/yyj/edge_memory/数据合成/doc_multi_doc_multi_qa_short_sum_synthetic_text_128_en/Qwen3-30B-A3B-Instruct-2507__vllm",
-            "task": "multi_doc_qa", "max_files": 50, "max_samples": 500000},
-        {
-            "dir": "/share/yyj/edge_memory/数据合成/doc_multi_doc_multi_qa_short_sum_synthetic_text_128_zh/Qwen3-30B-A3B-Instruct-2507__vllm",
-            "task": "multi_doc_qa", "max_files": 50, "max_samples": 300000},
-    ]
+    data_config = DEFAULT_DATA_CONFIG
 
-    # data_config = [
-    #     {"dir": "/share/yyj/edge_memory/数据合成/doc_sum_qa_shortsum_synthetic_text_128_en/Qwen3-30B-A3B-Instruct-2507__vllm",
-    #      "task": "qa_and_sum", "max_files": 10, "max_samples": 10000},
-    # ]
+    # data_config = [{"dir": "...", "task": "qa_and_sum", "max_files": 10, "max_samples": 10000}]
 
-    tokenizer_decoder = AutoTokenizer.from_pretrained(decoder_path, trust_remote_code=True)
-    tokenizer_encoder = AutoTokenizer.from_pretrained(encoder_path, trust_remote_code=True, padding_side="left")
-    placeholder_token = tokenizer_decoder.convert_ids_to_tokens(placeholder_id)
+    tokenizer_decoder = AutoTokenizer.from_pretrained(args.decoder_base_model_path, trust_remote_code=True)
+    tokenizer_encoder = AutoTokenizer.from_pretrained(args.encoder_base_model_path, trust_remote_code=True, padding_side="left")
+    placeholder_token = tokenizer_decoder.convert_ids_to_tokens(args.placeholder_id)
 
-    print("Loading encoder from", encoder_path)
+    print("Loading encoder from", args.encoder_base_model_path)
     encoder = AutoModel.from_pretrained(
-        encoder_path,
+        args.encoder_base_model_path,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
     ).eval()
 
-    print("Loading decoder from", decoder_path)
+    print("Loading decoder from", args.decoder_base_model_path)
     decoder = AutoModelForCausalLM.from_pretrained(
-        decoder_path,
+        args.decoder_base_model_path,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
     ).eval()
 
     #gradient_checkpointing_enable
-    if use_gradient_checkpointing:
+    if args.use_gradient_checkpointing:
         encoder.gradient_checkpointing_enable({"use_reentrant": False})
         decoder.gradient_checkpointing_enable({"use_reentrant": False})
 
     model = CtxCompModel(
         encoder=encoder,
         decoder=decoder,
-        placeholder_token_id=placeholder_id,
-        memory_token_begin_id=memory_token_begin_id,
-        comp_ratio_or_len=comp_ratio_or_len,
-        mlp_converter_hidden_dim=4096,
-        feature_extract_method=feature_extract_method,
-        encoder_training=encoder_training,
-        decoder_training=decoder_training,
+        placeholder_token_id=args.placeholder_id,
+        memory_token_begin_id=args.memory_token_begin_id,
+        comp_ratio_or_len=args.comp_ratio_or_len,
+        mlp_converter_hidden_dim=args.mlp_converter_hidden_dim,
+        feature_extract_method=args.feature_extract_method,
+        encoder_training=args.encoder_training,
+        decoder_training=args.decoder_training,
     )
 
     emb_lora_config = LoraConfig(r=16, lora_alpha=32, target_modules="all-linear", lora_dropout=0.1, bias="none", use_rslora=True)
@@ -494,37 +456,41 @@ def main():
     model.print_trainable_parameters()
 
     with train_args.main_process_first(desc="Loading dataset"):
-        num_proc = 40
         ds = load_from_data_config(
             data_config=data_config,
             tokenizer_decoder=tokenizer_decoder,
             tokenizer_encoder=tokenizer_encoder,
-            num_proc=num_proc,
-            max_length=decoder_max_length,
-            min_length=decoder_min_length,
-            doc_max_length=doc_max_length,
-            doc_min_length=doc_min_length,
-            comp_ratio_or_len=comp_ratio_or_len,
+            num_proc=args.dataset_num_proc,
+            max_length=args.decoder_max_length,
+            min_length=args.decoder_min_length,
+            context_max_length=args.context_max_length,
+            context_min_length=args.context_min_length,
+            comp_ratio_or_len=args.comp_ratio_or_len,
             placeholder_token=placeholder_token,
-            feature_extract_method=feature_extract_method,
+            feature_extract_method=args.feature_extract_method,
             seed=train_args.seed,
-            exclude_sign="eval",
-            generation_path=decoder_path,
-            template_dir=".",
+            exclude_sign=args.dataset_exclude_sign or None,
+            add_eos_token_to_context=args.add_eos_token_to_context,
+            generation_path=args.decoder_base_model_path,
+            template_dir=args.template_dir,
         )
         ds = ds.shuffle(seed=train_args.seed)
         print("Dataset size:", len(ds))
 
+    _collator_kw = {}
+    if args.collator_pad_to_multiple_of is not None:
+        _collator_kw["pad_to_multiple_of"] = args.collator_pad_to_multiple_of
     collator = CtxCompDataCollator(
         tokenizer=tokenizer_decoder,
         tokenizer_encoder=tokenizer_encoder,
         padding=True,
-        max_length=doc_max_length,
+        max_length=args.context_max_length,
         label_pad_token_id=-100,
+        **_collator_kw,
     )
     train_ds = ds.shuffle(seed=train_args.seed)
 
-    if GROUP_BY_LENGTH:
+    if args.group_by_length:
         trainer = BucketedCtxCompTrainer(
             model=model,
             args=train_args,
@@ -533,7 +499,7 @@ def main():
             eval_dataset=None,
             processing_class=tokenizer_decoder,
             length_column_name="context_len",
-            num_buckets=5,
+            num_buckets=args.num_buckets,
         )
     else:
         trainer = CtxCompTrainer(

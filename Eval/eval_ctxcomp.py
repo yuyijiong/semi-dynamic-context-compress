@@ -40,7 +40,7 @@ def normalize_for_acc(text):
     return text
 
 
-def acc_by_context_len(df, response_col="generated_text", recompute_acc=False):
+def acc_by_context_len(df, response_col="generated_text", recompute_acc=False, context_len_ranges=None):
     def _get_ref_texts(row):
         if "answers" in df.columns:
             ans = row.get("answers")
@@ -67,9 +67,9 @@ def acc_by_context_len(df, response_col="generated_text", recompute_acc=False):
     if "is_correct" not in df.columns or recompute_acc:
         df["is_correct"] = df.apply(_is_correct, axis=1)
     accuracy = df["is_correct"].mean()
-    print(f"Overall Accuracy: {accuracy * 100:.2f}%")
+    print(f"Overall Accuracy of this dataset: {accuracy * 100:.2f}%")
     sub_accuracy_list = []
-    for start, end in CONTEXT_LEN_RANGES:
+    for start, end in (context_len_ranges or []):
         sub_df = df[(df["context_len"] >= start) & (df["context_len"] < end)]
         if len(sub_df) > 0:
             sub_acc = sub_df["is_correct"].mean()
@@ -81,7 +81,7 @@ def acc_by_context_len(df, response_col="generated_text", recompute_acc=False):
     return {"overall_accuracy": round(float(accuracy) * 100, 1), "context_len_accuracies": sub_accuracy_list, "num_samples": len(df)}
 
 
-def compression_ratio_by_context_len(df, num_doc_tokens=None, is_dynamic=False):
+def compression_ratio_by_context_len(df, comp_ratio_or_len=None, is_dynamic=False, context_len_ranges=None):
     if "compressed_len" in df.columns:
         df_valid = df.copy()
         df_valid["compression_ratio"] = df_valid["context_len"] / df_valid["compressed_len"]
@@ -91,13 +91,13 @@ def compression_ratio_by_context_len(df, num_doc_tokens=None, is_dynamic=False):
         df_valid["compression_ratio"] = df_valid["context_len"] / df_valid["num_valid_tokens"]
     else:
         df_valid = df.copy()
-        df_valid["compression_ratio"] = df_valid["context_len"] / num_doc_tokens
+        df_valid["compression_ratio"] = df_valid["context_len"] / comp_ratio_or_len
     if len(df_valid) == 0:
         return None
     overall_ratio = df_valid["compression_ratio"].mean()
     print(f"Overall Avg Compression Ratio: {overall_ratio:.2f}")
     sub_ratio_list = []
-    for start, end in CONTEXT_LEN_RANGES:
+    for start, end in (context_len_ranges or []):
         sub_df = df_valid[(df_valid["context_len"] >= start) & (df_valid["context_len"] < end)]
         if len(sub_df) > 0:
             sub_ratio_list.append(round(float(sub_df["compression_ratio"].mean()), 2))
@@ -111,10 +111,10 @@ def compression_ratio_by_context_len(df, num_doc_tokens=None, is_dynamic=False):
     return out
 
 
-def aggregate_multi_dataset_results(records, identifier_keys):
+def aggregate_multi_dataset_results(records, identifier_keys, context_len_ranges=None):
     if not records:
         return None
-    num_buckets = len(CONTEXT_LEN_RANGES)
+    num_buckets = len(context_len_ranges) if context_len_ranges else 0
     total_samples = sum(r["num_samples"] for r in records)
     if total_samples == 0:
         return None
@@ -153,46 +153,77 @@ def aggregate_multi_dataset_results(records, identifier_keys):
     return out
 
 
-def aggregate_model_results(records, identifier_keys=None):
+def aggregate_model_results(records, identifier_keys=None, context_len_ranges=None):
     if identifier_keys is None:
         identifier_keys = ["bridge_model_path", "comp_ratio_or_len"] if records and "comp_ratio_or_len" in records[0] else ["bridge_model_path"]
-    return aggregate_multi_dataset_results(records, identifier_keys)
+    return aggregate_multi_dataset_results(records, identifier_keys, context_len_ranges=context_len_ranges)
 
 
 def _ratio_based(feature_extract_method):
     return feature_extract_method in ("mean_pooling", "mean_pooling_causal")
 
 
+def _tokenize_context_with_optional_eos(text, tokenizer_encoder, add_eos_token_to_context: bool):
+    encodings = tokenizer_encoder(text)
+    input_ids = list(encodings["input_ids"])
+    if add_eos_token_to_context:
+        eos_id = tokenizer_encoder.eos_token_id
+        if eos_id is None:
+            raise ValueError(
+                "tokenize_context: tokenizer has no eos_token_id; define eos on the tokenizer or pass add_eos_token_to_context=False"
+            )
+        if not input_ids or input_ids[-1] != eos_id:
+            input_ids.append(eos_id)
+    return input_ids
+
+
+def _normalize_context_input_ids_row(x):
+    if isinstance(x, np.ndarray):
+        x = x.tolist()
+    return [int(t) for t in x]
+
+
+def stack_padded_context_input_ids(rows, pad_id, device):
+    """Pad variable-length context token id lists to a batch tensor (left padding, content right-aligned)."""
+    max_len = max(len(r) for r in rows)
+    context_input_ids = torch.full((len(rows), max_len), pad_id, dtype=torch.long, device=device)
+    context_attention_mask = torch.zeros((len(rows), max_len), dtype=torch.long, device=device)
+    for i, ids in enumerate(rows):
+        L = len(ids)
+        context_input_ids[i, max_len - L:] = torch.tensor(ids, dtype=torch.long, device=device)
+        context_attention_mask[i, max_len - L:] = 1
+    return context_input_ids, context_attention_mask
+
+
 def prepare_eval_dataframe(
     df,
     *,
     tokenizer_decoder,
-    doc_min_length,
-    doc_max_length,
+    context_min_length,
+    context_max_length,
     max_sample_num_per_ds=None,
     tokenizer_encoder=None,
-    embedding_path=None,
     is_bridge=False,
     placeholder_token=None,
     feature_extract_method=None,
-    current_num_doc_tokens=None,
+    comp_ratio_or_len=None,
     single_placeholder=False,
-    force_context_len_recompute=False,
+    add_eos_token_to_context: bool = True,
 ):
     df = df.reset_index(drop=True)
     if is_bridge:
         if tokenizer_encoder is None:
             raise ValueError("is_bridge=True requires tokenizer_encoder")
-        if "context_len" not in df.columns or force_context_len_recompute:
-            df["context_len"] = df["context"].apply(lambda x: len(tokenizer_encoder.encode(x)))
-        elif embedding_path and "embedding" in (embedding_path or "").lower():
-            df["context_len"] = df["context_len"] + 1
+        df["context_input_ids"] = df["context"].apply(
+            lambda x: _tokenize_context_with_optional_eos(x, tokenizer_encoder, add_eos_token_to_context)
+        )
+        df["context_len"] = df["context_input_ids"].apply(len)
         if not single_placeholder:
-            if _ratio_based(feature_extract_method or "") and isinstance(current_num_doc_tokens, (float, int)) and 0 < current_num_doc_tokens <= 1:
-                pool_size = max(1, round(1.0 / float(current_num_doc_tokens)))
+            if _ratio_based(feature_extract_method or "") and isinstance(comp_ratio_or_len, (float, int)) and 0 < comp_ratio_or_len <= 1:
+                pool_size = max(1, round(1.0 / float(comp_ratio_or_len)))
                 df["compressed_len"] = df["context_len"].apply(lambda cl: max(1, (cl + pool_size - 1) // pool_size))
             else:
-                n_placeholders = int(current_num_doc_tokens) if current_num_doc_tokens is not None else 64
+                n_placeholders = int(comp_ratio_or_len) if comp_ratio_or_len is not None else 64
                 df["compressed_len"] = n_placeholders
         if single_placeholder:
             df["padded_question"] = df.apply(lambda row: f"Context: {placeholder_token}\nQuestion: {row['question']}", axis=1)
@@ -211,7 +242,7 @@ def prepare_eval_dataframe(
             add_generation_prompt=True,
         )
     df["templated_prompt"] = df["padded_question"].apply(_apply_chat_template)
-    df_filtered = df[(df["context_len"] >= doc_min_length) & (df["context_len"] <= doc_max_length)].copy()
+    df_filtered = df[(df["context_len"] >= context_min_length) & (df["context_len"] <= context_max_length)].copy()
     df_filtered.reset_index(drop=True, inplace=True)
     if max_sample_num_per_ds is not None and len(df_filtered) > max_sample_num_per_ds:
         df_filtered = df_filtered[:max_sample_num_per_ds].reset_index(drop=True)
@@ -246,25 +277,27 @@ def evaluate_and_append_result(
     bridge_model_path,
     results_jsonl_path,
     is_bridge,
-    current_num_doc_tokens=None,
+    comp_ratio_or_len=None,
     response_col="generated_text",
     feature_extract_method=None,
     is_dynamic=False,
-    num_doc_tokens_for_dynamic=None,
+    comp_ratio_or_len_for_dynamic=None,
     extra_result_record=None,
+    context_len_ranges=None,
 ):
-    accuracy_info = acc_by_context_len(df_filtered, response_col)
+    accuracy_info = acc_by_context_len(df_filtered, response_col, context_len_ranges=context_len_ranges)
     compression_info = None
     if is_bridge:
         compression_info = compression_ratio_by_context_len(
             df_filtered,
-            num_doc_tokens=num_doc_tokens_for_dynamic if is_dynamic else current_num_doc_tokens,
+            comp_ratio_or_len=comp_ratio_or_len_for_dynamic if is_dynamic else comp_ratio_or_len,
             is_dynamic=is_dynamic,
+            context_len_ranges=context_len_ranges,
         )
     result_record = {
         "dataset": dataset_name,
         "bridge_model_path": bridge_model_path,
-        "comp_ratio_or_len": current_num_doc_tokens,
+        "comp_ratio_or_len": comp_ratio_or_len,
         "num_samples": accuracy_info["num_samples"],
         "overall_accuracy": accuracy_info["overall_accuracy"],
         "context_len_accuracies": accuracy_info["context_len_accuracies"],
@@ -274,9 +307,10 @@ def evaluate_and_append_result(
         result_record.update(compression_info)
     if extra_result_record:
         result_record.update(extra_result_record)
-    pathlib.Path(results_jsonl_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(results_jsonl_path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(result_record, ensure_ascii=False) + "\n")
+    if results_jsonl_path is not None:
+        pathlib.Path(results_jsonl_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(results_jsonl_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(result_record, ensure_ascii=False) + "\n")
     return result_record
 
 
@@ -303,16 +337,13 @@ def batch_generate_worker_ctxcomp(args):
             dtype=torch.bfloat16,
             attn_implementation="flash_attention_2",
             device_map={"": gpu_id},
+            share_base_model_inference=False
         ).eval()
 
         print("Share base model: ",model._shared_base_model)
 
-        embedding_path = model_config.get("base_encoder_model_path") or model_config.get("base_embed_model_path")
-        if not embedding_path:
-            raise ValueError(f"Bridge model missing encoder path in config: {bridge_model_path}")
-        if "embedding" not in embedding_path.lower():
-            embedding_path = "/share/models/Qwen3-Embedding-0.6B"  # 强制使用Embedding模型的tokenizer
-        generation_path = model_config.get("base_decoder_model_path") or model_config.get("base_gen_model_path")
+        embedding_path = model_config.get("base_encoder_model_path")
+        generation_path = model_config.get("base_decoder_model_path")
         if generation_path is None:
             raise ValueError(f"Bridge model missing decoder path in config: {bridge_model_path}")
         tokenizer_decoder = AutoTokenizer.from_pretrained(generation_path, trust_remote_code=True, padding_side="left")
@@ -323,7 +354,7 @@ def batch_generate_worker_ctxcomp(args):
             bridge_model_path,
             trust_remote_code=True,
             dtype=torch.bfloat16,
-            #attn_implementation="flash_attention_2",
+            attn_implementation="flash_attention_2",
             device_map={"": gpu_id},
         ).eval()
         tokenizer_decoder = AutoTokenizer.from_pretrained(bridge_model_path, trust_remote_code=True, padding_side="left")
@@ -333,7 +364,7 @@ def batch_generate_worker_ctxcomp(args):
     df_subset = df_subset.reset_index(drop=True)
     results = []
 
-    for batch_start in tqdm(range(0, len(df_subset), batch_size), desc=f"GPU {gpu_id}"):
+    for batch_start in tqdm(range(0, len(df_subset), batch_size), desc=f"GPU {gpu_id}",mininterval=10):
         batch_end = min(batch_start + batch_size, len(df_subset))
         batch_df = df_subset.iloc[batch_start:batch_end]
         batch_templated = batch_df["templated_prompt"].tolist()
@@ -341,18 +372,26 @@ def batch_generate_worker_ctxcomp(args):
         input_ids = input_encoded["input_ids"].to(device)
         attention_mask = input_encoded["attention_mask"].to(device)
         if is_bridge:
-            batch_docs = batch_df["context"].tolist()
-            doc_encoded = tokenizer_encoder(batch_docs, return_tensors="pt", padding=True)
-            doc_input_ids = doc_encoded["input_ids"].to(device)
-            doc_attention_mask = doc_encoded["attention_mask"].to(device)
+            if "context_input_ids" not in batch_df.columns:
+                raise ValueError(
+                    "Bridge eval requires column context_input_ids from prepare_eval_dataframe; re-run data prep or use force_recompute."
+                )
+            rows = [_normalize_context_input_ids_row(x) for x in batch_df["context_input_ids"]]
+            pad_id = tokenizer_encoder.pad_token_id or tokenizer_encoder.eos_token_id
+            context_input_ids, context_attention_mask = stack_padded_context_input_ids(rows, pad_id, device)
+            eos_token_id = tokenizer_decoder.eos_token_id
+            # 与旧版一致：多数 CausalLM 未设置 pad_token_id，必须为 None 时回退 eos，否则 batch generate 易异常
+            pad_token_id = tokenizer_decoder.pad_token_id or tokenizer_decoder.eos_token_id
             gen_kw = dict(
-                doc_input_ids=doc_input_ids,
+                context_input_ids=context_input_ids,
                 input_ids=input_ids,
-                doc_attention_mask=doc_attention_mask,
+                context_attention_mask=context_attention_mask,
                 attention_mask=attention_mask,
                 do_sample=False,
                 max_new_tokens=512,
-                use_cache=True
+                use_cache=True,
+                eos_token_id=eos_token_id,
+                pad_token_id=pad_token_id,
             )
             if comp_ratio_or_len_override is not None:
                 gen_kw["comp_ratio_or_len_override"] = comp_ratio_or_len_override
@@ -360,6 +399,9 @@ def batch_generate_worker_ctxcomp(args):
             for i, output in enumerate(generation_outputs):
                 generated_text = tokenizer_decoder.decode(output, skip_special_tokens=True)
                 results.append({"index": original_indices[batch_start + i], "generated_text": generated_text})
+            if batch_start ==0:
+                print("generated_text: ",generated_text)
+
         else:
             generation_outputs = model.generate(
                 input_ids=input_ids,
@@ -374,16 +416,16 @@ def batch_generate_worker_ctxcomp(args):
                 generated_ids = generation_outputs[i, int(input_lengths[i].item()):]
                 generated_text = tokenizer_decoder.decode(generated_ids, skip_special_tokens=True)
                 results.append({"index": original_indices[batch_start + i], "generated_text": generated_text})
-                if batch_start ==0:
-                    print("generated_text: ",generated_text)
+            if batch_start ==0:
+                print("generated_text: ",generated_text)
 
     return results
 
 
 if __name__ == "__main__":
     LONG_CONTEXT=False
-    doc_max_length = 40000 if LONG_CONTEXT else 2048
-    doc_min_length = 128
+    context_max_length = 40000 if LONG_CONTEXT else 2048
+    context_min_length = 128
     batch_size = 1 if LONG_CONTEXT else 8
     CONTEXT_LEN_RANGES = [(1, 10000), (10000, 20000), (20000, 30000),
                           (30000, 40000)]  if LONG_CONTEXT else [(64, 128), (128, 256), (256, 512), (512, 1024), (1024, 2048)]
@@ -391,32 +433,38 @@ if __name__ == "__main__":
     eval_acc = True
     max_sample_num_per_ds = 1000
     force_recompute = True
-    force_context_len_recompute=True if LONG_CONTEXT else False
     gpu_ids = [0, 1, 2, 3, 4, 5, 6, 7]#[0]#
     num_processes = len(gpu_ids)
     comp_ratio_or_len_override = None  # or list to evaluate each ratio
 
     bridge_model_path_list = [
-        #"/share/yyj/edge_memory/semi_dynamic_soft_context_compress/SFT/training_output_swa/ctxcomp-fusang-static-swa=2k-layers=[0,2,4]-mean_pooling-doclen=34000to128-comp=0.25-enc=lora-dec=lora/checkpoint-6000"
-        #"//share/yyj/edge_memory/semi_dynamic_soft_context_compress/SFT/training_output_swa/ctxcomp-fusang-static-swanone-mean_pooling-doclen=34000to128-comp=0.25-enc=lora-dec=lora/checkpoint-2000"
-        #"//share/yyj/edge_memory/semi_dynamic_soft_context_compress/SFT/training_output_swa/ctxcomp-static-swa2k-mean_pooling-doclen=34000to128-comp=0.25-enc=lora-dec=lora/checkpoint-10000",
+        #"/share/yyj/edge_memory/semi_dynamic_soft_context_compress/SFT/training_output/ctxcomp-static-mean_pooling-contextlen=1034to64-comp=0.25-enc=Qwen3.5-0.8B-lora-dec=Qwen3.5-0.8B-lora/checkpoint-40000"
+
+        #"/share/yyj/edge_memory/semi_dynamic_soft_context_compress/SFT/training_output_swa/ctxcomp-fusang-static-swa=2k-layers=[0,2,4]-mean_pooling-contextlen=34000to128-comp=0.25-enc=lora-dec=lora/checkpoint-6000"
+        #"//share/yyj/edge_memory/semi_dynamic_soft_context_compress/SFT/training_output_swa/ctxcomp-fusang-static-swanone-mean_pooling-contextlen=34000to128-comp=0.25-enc=lora-dec=lora/checkpoint-2000"
+        #"//share/yyj/edge_memory/semi_dynamic_soft_context_compress/SFT/training_output_swa/ctxcomp-static-swa2k-mean_pooling-contextlen=34000to128-comp=0.25-enc=lora-dec=lora/checkpoint-10000",
         #"/share/models/Qwen3-4B-Instruct-2507",
         #"/share/models/Qwen3-0.6B",
-        "/share/models/Qwen3.5-0.8B",
+        #"/share/models/Qwen3.5-0.8B",
+        "/share/yyj/edge_memory/semi_dynamic_soft_context_compress/SFT/training_output/ctxcomp-semi-dynamic-mean_pooling-contextlen=1300to64-ratios=0.5_0.03125-enc=lora-dec=lora/checkpoint-100000"
 
     ]
 
     EVAL_DATA_DIR = pathlib.Path(__file__).resolve().parent / "eval_data"
     DATASETS = {
-        "hotpotqa": str(EVAL_DATA_DIR / "hotpot_qa/distractor/validation_cqa.parquet"),
-        "squad": str(EVAL_DATA_DIR / "squad_v2/valid_answers_text.parquet"),
-        "NQ": str(EVAL_DATA_DIR / "NQ_short/validation_cqa.parquet"),
-        "adversarialQA": str(EVAL_DATA_DIR / "adversarialQA/validation_cqa.parquet"),
-        #"longmemeval":"/share/yyj/edge_memory/semi_dynamic_soft_context_compress/Eval/eval_data_long/longmemeval_24k.parquet"
-    }
+        #"hotpotqa": str(EVAL_DATA_DIR / "hotpotqa_validation_cqa.parquet"),
+        "squad": str(EVAL_DATA_DIR / "squad_validation_cqa.parquet"),
+        "NQ": str(EVAL_DATA_DIR / "NQ_validation_cqa.parquet"),
+        "adversarialQA": str(EVAL_DATA_DIR / "adverserialqa_validation_cqa.parquet"),
+    } if not LONG_CONTEXT else {"longmemeval":"/share/yyj/edge_memory/semi_dynamic_soft_context_compress/Eval/eval_data_long/longmemeval_24k.parquet"}
 
     dataset_names_sorted = sorted(DATASETS.keys())
-    summary_jsonl_path = f"eval_aggregate_ctxcomp_{'_'.join(dataset_names_sorted)}_doclen={doc_min_length}to{doc_max_length}.jsonl" if len(DATASETS) > 1 else None
+    multi_dataset = len(DATASETS) > 1
+    summary_jsonl_path = (
+        f"eval_aggregate_ctxcomp_{'_'.join(dataset_names_sorted)}_contextlen={context_min_length}to{context_max_length}.jsonl"
+        if multi_dataset
+        else None
+    )
 
     for model_idx, bridge_model_path in enumerate(bridge_model_path_list):
         print(f"\n{'='*80}\nModel {model_idx+1}/{len(bridge_model_path_list)}: {bridge_model_path}")
@@ -427,12 +475,6 @@ if __name__ == "__main__":
 
         if is_bridge:
             embedding_path = model_config.get("base_encoder_model_path") or model_config.get("base_embed_model_path")
-            if not embedding_path:
-                print("Skip: bridge model has no base_encoder_model_path/base_embed_model_path in config.")
-                continue
-            if "embedding" not in embedding_path.lower():
-                embedding_path = "/share/models/Qwen3-Embedding-0.6B" #强制使用Embedding模型的tokenizer
-
             placeholder_token_id = model_config["placeholder_token_id"]
             raw_comp_ratio_or_len = comp_ratio_or_len_override if comp_ratio_or_len_override is not None else model_config.get("comp_ratio_or_len", model_config.get("num_doc_tokens", 0.25))
             feature_extract_method = model_config.get("feature_extract_method", model_config.get("compress_method", "mean_pooling"))
@@ -441,7 +483,6 @@ if __name__ == "__main__":
             placeholder_token = tokenizer_decoder.convert_ids_to_tokens(placeholder_token_id)
             rates_to_eval = list(raw_comp_ratio_or_len) if isinstance(raw_comp_ratio_or_len, (list, tuple)) else [raw_comp_ratio_or_len]
         else:
-            embedding_path = None
             feature_extract_method = "no-compress"
             tokenizer_decoder = AutoTokenizer.from_pretrained(bridge_model_path, trust_remote_code=True)
             tokenizer_encoder = None
@@ -456,28 +497,11 @@ if __name__ == "__main__":
                     print(f"Skip (file not found): {data_path}")
                     continue
                 print(f"\n>>> Dataset: {dataset_name} ({data_path})")
-                results_jsonl_path = f"eval_ctxcomp_{dataset_name}_doclen={doc_min_length}to{doc_max_length}.jsonl"
-                df = pd.read_parquet(data_path)
-                df_filtered = prepare_eval_dataframe(
-                    df,
-                    tokenizer_decoder=tokenizer_decoder,
-                    doc_min_length=doc_min_length,
-                    doc_max_length=doc_max_length,
-                    max_sample_num_per_ds=max_sample_num_per_ds,
-                    tokenizer_encoder=tokenizer_encoder,
-                    embedding_path=embedding_path,
-                    is_bridge=is_bridge,
-                    placeholder_token=placeholder_token,
-                    feature_extract_method=feature_extract_method,
-                    current_num_doc_tokens=current_comp,
-                    force_context_len_recompute=force_context_len_recompute
+                results_jsonl_path = (
+                    None
+                    if multi_dataset
+                    else f"eval_ctxcomp_{dataset_name}_contextlen={context_min_length}to{context_max_length}.jsonl"
                 )
-                config = {
-                    "bridge_model_path": bridge_model_path,
-                    "comp_ratio_or_len_override": current_comp,
-                    "batch_size": batch_size,
-                    "is_bridge": is_bridge,
-                }
                 save_dir = f"eval_results/{dataset_name}"
                 p = pathlib.Path(bridge_model_path)
                 base_name = f"{p.parent.name}-{p.name}"
@@ -487,9 +511,28 @@ if __name__ == "__main__":
 
                 if df_exists and not force_recompute:
                     print(f"Loading existing results: {save_path}")
-                    df_filtered = pd.read_parquet(save_path)
-                    df_filtered = df_filtered.reset_index(drop=True)
+                    df_filtered = pd.read_parquet(save_path).reset_index(drop=True)
                 else:
+                    df = pd.read_parquet(data_path)
+                    df_filtered = prepare_eval_dataframe(
+                        df,
+                        tokenizer_decoder=tokenizer_decoder,
+                        context_min_length=context_min_length,
+                        context_max_length=context_max_length,
+                        max_sample_num_per_ds=max_sample_num_per_ds,
+                        tokenizer_encoder=tokenizer_encoder,
+                        is_bridge=is_bridge,
+                        placeholder_token=placeholder_token,
+                        feature_extract_method=feature_extract_method,
+                        comp_ratio_or_len=current_comp,
+                        add_eos_token_to_context=False
+                    )
+                    config = {
+                        "bridge_model_path": bridge_model_path,
+                        "comp_ratio_or_len_override": current_comp,
+                        "batch_size": batch_size,
+                        "is_bridge": is_bridge,
+                    }
                     df_filtered = run_batch_generation(df_filtered, config, gpu_ids, num_processes, batch_generate_worker_ctxcomp)
 
                 if eval_acc:
@@ -499,8 +542,9 @@ if __name__ == "__main__":
                         bridge_model_path,
                         results_jsonl_path,
                         is_bridge=is_bridge,
-                        current_num_doc_tokens=current_comp,
+                        comp_ratio_or_len=current_comp,
                         feature_extract_method=feature_extract_method,
+                        context_len_ranges=CONTEXT_LEN_RANGES,
                     )
                     model_records.append(result_record.copy())
 
@@ -509,9 +553,11 @@ if __name__ == "__main__":
                     pathlib.Path(save_dir).mkdir(parents=True, exist_ok=True)
                     df_filtered.to_parquet(save_path)
 
-            if summary_jsonl_path and model_records:
-                summary = aggregate_model_results(model_records)
-                with open(summary_jsonl_path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(summary, ensure_ascii=False) + "\n")
+            if model_records:
+                if multi_dataset and summary_jsonl_path:
+                    summary = aggregate_model_results(model_records, context_len_ranges=CONTEXT_LEN_RANGES)
+                    pathlib.Path(summary_jsonl_path).parent.mkdir(parents=True, exist_ok=True)
+                    with open(summary_jsonl_path, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(summary, ensure_ascii=False) + "\n")
 
 #nohup python eval_ctxcomp.py > eval_comp.log 2>&1 &

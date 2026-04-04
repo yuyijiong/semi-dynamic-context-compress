@@ -108,6 +108,18 @@ def compression_ratio_by_context_len(df, comp_ratio_or_len=None, is_dynamic=Fals
         df_correct = df_valid[df_valid["is_correct"].astype(bool)]
         if len(df_correct) > 0:
             out["avg_comp_ratio_correct"] = round(float(df_correct["compression_ratio"].mean()), 2)
+            correct_context_len_sum = int(df_correct["context_len"].sum())
+            if "compressed_len" in df_correct.columns:
+                correct_compressed_sum = int(df_correct["compressed_len"].sum())
+            elif "num_valid_tokens" in df_correct.columns:
+                correct_compressed_sum = int(df_correct["num_valid_tokens"].sum())
+            else:
+                correct_compressed_sum = len(df_correct) * int(comp_ratio_or_len)
+            out["correct_context_len_sum"] = correct_context_len_sum
+            out["correct_compressed_sum"] = correct_compressed_sum
+            if correct_compressed_sum > 0:
+                out["avg_comp_ratio_correct_by_tokens"] = round(correct_context_len_sum / correct_compressed_sum, 2)
+                print(f"Avg Compression Ratio by tokens (correct only): {out['avg_comp_ratio_correct_by_tokens']:.2f}")
     return out
 
 
@@ -138,18 +150,32 @@ def aggregate_multi_dataset_results(records, identifier_keys, context_len_ranges
         "total_num_samples": total_samples,
         "per_dataset_num_samples": {r["dataset"]: r["num_samples"] for r in records},
     })
-    if records[0].get("avg_comp_ratio") is not None:
-        w_total = sum(r["num_samples"] for r in records)
-        out["avg_comp_ratio"] = round(sum(r["avg_comp_ratio"] * r["num_samples"] for r in records) / w_total, 2)
+    records_with_comp = [r for r in records if r.get("avg_comp_ratio") is not None]
+    if records_with_comp:
+        w_total = sum(r["num_samples"] for r in records_with_comp)
+        out["avg_comp_ratio"] = round(sum(r["avg_comp_ratio"] * r["num_samples"] for r in records_with_comp) / w_total, 2)
         out["comp_ratio_by_ctx_len"] = []
         for i in range(num_buckets):
-            vals = [(r["comp_ratio_by_ctx_len"][i], r["num_samples"]) for r in records if i < len(r["comp_ratio_by_ctx_len"]) and r["comp_ratio_by_ctx_len"][i] is not None]
+            vals = [(r["comp_ratio_by_ctx_len"][i], r["num_samples"]) for r in records_with_comp if i < len(r["comp_ratio_by_ctx_len"]) and r["comp_ratio_by_ctx_len"][i] is not None]
             if vals:
                 s = sum(v * w for v, w in vals)
                 w = sum(w for _, w in vals)
                 out["comp_ratio_by_ctx_len"].append(round(s / w, 2))
             else:
                 out["comp_ratio_by_ctx_len"].append(None)
+        records_with_correct = [r for r in records_with_comp if r.get("avg_comp_ratio_correct") is not None]
+        if records_with_correct:
+            num_correct_list = [r["overall_accuracy"] / 100.0 * r["num_samples"] for r in records_with_correct]
+            w_correct_total = sum(num_correct_list)
+            out["avg_comp_ratio_correct"] = round(
+                sum(r["avg_comp_ratio_correct"] * w for r, w in zip(records_with_correct, num_correct_list)) / w_correct_total, 2
+            ) if w_correct_total > 0 else None
+        records_with_tokens = [r for r in records_with_comp if r.get("correct_context_len_sum") is not None and r.get("correct_compressed_sum") is not None]
+        if records_with_tokens:
+            total_ctx_correct = sum(r["correct_context_len_sum"] for r in records_with_tokens)
+            total_comp_correct = sum(r["correct_compressed_sum"] for r in records_with_tokens)
+            if total_comp_correct > 0:
+                out["avg_comp_ratio_correct_by_tokens"] = round(total_ctx_correct / total_comp_correct, 2)
     return out
 
 
@@ -446,13 +472,13 @@ if __name__ == "__main__":
         #"/share/models/Qwen3-4B-Instruct-2507",
         #"/share/models/Qwen3-0.6B",
         #"/share/models/Qwen3.5-0.8B",
-        "/share/yyj/edge_memory/semi_dynamic_soft_context_compress/SFT/training_output/ctxcomp-semi-dynamic-mean_pooling-contextlen=1300to64-ratios=0.5_0.03125-enc=lora-dec=lora/checkpoint-100000"
+        "../SFT/training_output/ctxcomp-semi-dynamic-mean_pooling-contextlen=1300to64-ratios=0.5_0.03125-enc=Qwen3.5-0.8B-lora-dec=Qwen3.5-0.8B-lora/checkpoint-100000"
 
     ]
 
     EVAL_DATA_DIR = pathlib.Path(__file__).resolve().parent / "eval_data"
     DATASETS = {
-        #"hotpotqa": str(EVAL_DATA_DIR / "hotpotqa_validation_cqa.parquet"),
+        "hotpotqa": str(EVAL_DATA_DIR / "hotpotqa_validation_cqa.parquet"),
         "squad": str(EVAL_DATA_DIR / "squad_validation_cqa.parquet"),
         "NQ": str(EVAL_DATA_DIR / "NQ_validation_cqa.parquet"),
         "adversarialQA": str(EVAL_DATA_DIR / "adverserialqa_validation_cqa.parquet"),
@@ -525,7 +551,7 @@ if __name__ == "__main__":
                         placeholder_token=placeholder_token,
                         feature_extract_method=feature_extract_method,
                         comp_ratio_or_len=current_comp,
-                        add_eos_token_to_context=False
+                        add_eos_token_to_context=True
                     )
                     config = {
                         "bridge_model_path": bridge_model_path,

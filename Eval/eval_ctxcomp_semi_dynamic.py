@@ -121,7 +121,7 @@ if __name__ == "__main__":
     context_min_length = 128
     eval_acc = True
     max_sample_num_per_ds = 1000
-    force_recompute = False
+    force_recompute = True
     batch_size = 8
     gpu_ids = [0, 1, 2, 3, 4, 5, 6, 7]
     num_processes = len(gpu_ids)
@@ -129,7 +129,7 @@ if __name__ == "__main__":
                           (30000, 40000)]
 
     bridge_model_path_list = [
-        "../SFT/training_output/ctxcomp-semi-dynamic-mean_pooling-contextlen=1300to64-ratios=0.5_0.03125-enc=lora-dec=lora/checkpoint-100000"
+        "../SFT/training_output/ctxcomp-semi-dynamic-mean_pooling-contextlen=1300to64-ratios=0.5_0.03125-enc=Qwen3.5-0.8B-lora-dec=Qwen3.5-0.8B-lora/checkpoint-100000"
 ,
     ]
 
